@@ -528,12 +528,20 @@ func TestTLSFilesAreReadAtMostOncePerRecheck(t *testing.T) {
 	write(t, cfg.certFile, crt)
 	write(t, cfg.keyFile, key)
 	src := &tlsSource{cfg: cfg, logger: discard}
-	first, _ := src.get(nil)
+	first, err := src.get(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	crt, key = p.issue(t, "two", 3)
 	write(t, cfg.certFile, crt)
 	write(t, cfg.keyFile, key)
 	if again, _ := src.get(nil); again != first {
 		t.Error("files were re-read inside the recheck interval")
+	}
+	src.checked = time.Now().Add(-cfg.recheck)
+	second, err := src.get(nil)
+	if err != nil || second == first || second.Certificates[0].Leaf.Subject.CommonName != "two" {
+		t.Fatalf("replacement certificate was not installed after recheck: %v", err)
 	}
 }
 

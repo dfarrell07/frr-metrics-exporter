@@ -288,6 +288,9 @@ func TestMalformedReadsEmitNothing(t *testing.T) {
 		"evpn empty vni":    {all[2], map[string]string{"show evpn vni json": `{"not-a-vni":{}}`}},
 		"evpn wrong shape":  {all[2], map[string]string{"show evpn vni json": "[1]"}},
 	} {
+		if tc.c.Name == "evpn" {
+			tc.replies[esCmd] = "@evpn_es_empty.json"
+		}
 		ms := Gather(context.Background(), fake(tc.replies), []Collector{tc.c}, discard)
 		got := series(t, ms)
 		key := fmt.Sprintf(`frrk8s_scrape_collector_success{collector=%q}`, tc.c.Name)
