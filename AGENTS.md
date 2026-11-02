@@ -32,7 +32,8 @@ Run all four before committing. Sign off commits (`git commit -s`).
 - Every new behavior needs a test, and the test must fail when the behavior is removed: mutate the
   code and check. Past misses: `limitBuffer` must not embed `bytes.Buffer` (`io.Copy` bypasses
   `Write`); a test client with a short timeout hid a missing `srv.Close()`.
-- vtysh stdout only (stderr is error context). Use `Vtysh{}`, no package globals.
+- vtysh stdout only (stderr is error context). Use `Vtysh{Path: "/usr/bin/vtysh"}` (or the configured
+  executable path); no package globals.
 - Shell: this environment's zsh does not word-split `$var`; write flags out.
 
 ## Where the rest lives (EGA repo, github.com/openshift/evpn-gateway-appliance)
