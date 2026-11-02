@@ -12,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -31,6 +33,115 @@ import (
 )
 
 var discard = slog.New(slog.DiscardHandler)
+
+func TestScrapeTimeoutFlagBounds(t *testing.T) {
+	args, flags := os.Args, flag.CommandLine
+	t.Cleanup(func() { os.Args, flag.CommandLine = args, flags })
+	maxTimeout := time.Duration(1<<63-1) - 5*time.Second
+	for _, timeout := range []time.Duration{-1, 0, 100 * time.Millisecond, maxTimeout, maxTimeout + 1, time.Duration(1<<63 - 1)} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			flag.CommandLine = flag.NewFlagSet("exporter", flag.ContinueOnError)
+			os.Args = []string{"exporter", "--tls-cert-file=server.crt", "--tls-key-file=server.key", "--scrape-timeout=" + timeout.String()}
+			c, _, err := parseFlags()
+			valid := timeout > 0 && timeout <= maxTimeout
+			if (err == nil) != valid || c.timeout != timeout {
+				t.Fatalf("timeout %v: config=%v, error=%v, want valid=%v", timeout, c.timeout, err, valid)
+			}
+		})
+	}
+}
+
+func TestMainUsesConfiguredScrapeTimeout(t *testing.T) {
+	// Re-enter the real startup path in a child, including flags, runner and TLS.
+	if os.Getenv("FRR_TEST_EXPORTER_MAIN") == "1" {
+		os.Args = append(os.Args[:1], os.Args[3:]...) // discard -test.run and --
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+		main()
+		return
+	}
+	p, dir := newPKI(t), t.TempDir()
+	crt, key := p.issue(t, "server", 2)
+	certFile, keyFile := filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key")
+	write(t, certFile, crt)
+	write(t, keyFile, key)
+	vtysh, pidFile := filepath.Join(dir, "vtysh"), filepath.Join(dir, "pid")
+	write(t, vtysh, []byte("#!/bin/sh\necho $$ > \"$FRR_TEST_PID_FILE\"\nexec sleep 30\n"))
+	if err := os.Chmod(vtysh, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMainUsesConfiguredScrapeTimeout$", "--",
+		"--listen="+addr, "--tls-cert-file="+certFile, "--tls-key-file="+keyFile,
+		"--collectors=bgp", "--vtysh="+vtysh, "--scrape-timeout=100ms")
+	cmd.Env = append(os.Environ(), "FRR_TEST_EXPORTER_MAIN=1", "FRR_TEST_PID_FILE="+pidFile)
+	var output logs
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cmd.Process.Signal(syscall.SIGTERM)
+		// Kill the direct child as well on failure, so a mutant cannot leak it.
+		if t.Failed() {
+			if data, err := os.ReadFile(pidFile); err == nil {
+				var pid int
+				if _, err := fmt.Sscan(string(data), &pid); err == nil {
+					syscall.Kill(pid, syscall.SIGKILL)
+				}
+			}
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Errorf("exporter exit: %v", err)
+		}
+		if t.Failed() {
+			t.Log(output.buf.String()) // Wait has finished all writes.
+		}
+	})
+	for i := 0; ; i++ {
+		if conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond); err == nil {
+			conn.Close()
+			break
+		}
+		if i == 100 {
+			t.Fatal("exporter did not listen")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(p.ca)
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}, Timeout: 3 * time.Second}
+	defer client.CloseIdleConnections()
+	start := time.Now()
+	// No Prometheus timeout header: only --scrape-timeout can bound this read.
+	resp, err := client.Get("https://" + addr + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != http.StatusOK || time.Since(start) > 2*time.Second ||
+		!strings.Contains(string(body), `frrk8s_scrape_collector_success{collector="bgp"} 0`) {
+		t.Fatalf("scrape after %v: status=%d, error=%v, body=%s", time.Since(start), resp.StatusCode, err, body)
+	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	if _, err := fmt.Sscan(string(data), &pid); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(pid, 0); err != syscall.ESRCH {
+		t.Fatalf("vtysh child %d still exists after scrape: %v", pid, err)
+	}
+}
 
 func TestSmokeOnlyCleansResourcesItOwns(t *testing.T) {
 	dir := t.TempDir()
