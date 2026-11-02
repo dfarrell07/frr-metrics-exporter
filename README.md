@@ -1,71 +1,26 @@
 # frr-metrics-exporter
 
-Prometheus exporter for an FRR that runs **outside Kubernetes**, such as a VM or appliance. It
-reads FRR through `vtysh` and serves BGP, BFD and EVPN metrics over HTTPS with optional client
-certificates.
+Prometheus exporter for FRR running **outside Kubernetes**, on a host or in a container. It reads
+BGP, BFD and EVPN through `vtysh` and serves `/metrics` over HTTPS with optional mutual TLS
+(mTLS). This is a standalone reference implementation and source of portable collectors;
+appliance delivery and qualification remain open.
 
-It is a standalone reference implementation of the FRR series in the EGA metrics plan.
-Collectors use real FRR output ([fixtures and provenance](collector/testdata/README.md))
-and can be ported independently of the serving code.
+## Quickstart
 
-Existing BGP series names, types and labels follow frr-k8s's exporter (Apache-2.0, the MetalLB
-authors). The `frrk8s_` prefix is kept for compatibility; tell sources apart with scrape labels.
-BFD adds `local,interface,multihop` to upstream's `peer,vrf`: migrate joins and expected-session
-inventory to the five-label identity rather than merging distinct sessions. This is not a
-drop-in replacement for every legacy `frr_exporter` metric; uptime and process/RIB/AS metadata
-are not carried over.
-
-## Metrics
-
-| Series | Labels | Meaning |
-| --- | --- | --- |
-| `frrk8s_bgp_session_up` | `peer,vrf` | 1 if Established, 0 in every other state (the state's name is not exported). For an unnumbered peer `peer` is the interface name |
-| `frrk8s_bgp_announced_prefixes_total`, `frrk8s_bgp_received_prefixes_total` | `peer,vrf` | Gauges that **sum every address family**, as in frr-k8s |
-| `frrk8s_bgp_family_announced_prefixes`, `frrk8s_bgp_family_received_prefixes` | `peer,vrf,afi,safi` | Per family: `ipv4/unicast`, `ipv6/unicast`, `ipv4/vpn`, `l2vpn/evpn`; any other family counts only in the `_total` gauges. A count FRR did not report is absent, never 0 |
-| `frrk8s_bgp_{opens,notifications,updates,keepalives}_*`, `route_refresh_sent`, `total_*` | `peer,vrf` | Message counters, per TCP session |
-| `frrk8s_bfd_session_up`, `_control_packet_*`, `_echo_packet_*`, `_session_{up,down}_events`, `_zebra_notifications` | `peer,vrf,local,interface,multihop` | frr-k8s's BFD series with ordinary single-hop/multihop session identity, so several sessions to one peer stay distinct. `peer` is the address, so it matches the BGP `peer` for numbered peers only |
-| `frrk8s_evpn_vni_info` | `vni,vrf,type,interface` | 1 per VNI zebra knows: inventory, not health |
-| `frrk8s_evpn_macs`, `_neighbors`, `_remote_vteps` | `vni,vrf` | L2 VNIs only: MACs and ARP/ND entries zebra holds, and known remote VTEPs. A known VTEP is not proof of reachability |
-| `frrk8s_evpn_remote_vtep_present` | `vni,vrf,vtep` | Gauge 1 for each known remote VTEP of an L2 VNI. An absent list does not invent memberships or change the reported aggregate count |
-| `frrk8s_evpn_es_oper_up` | `esi` | Gauge 1/0 for a local Ethernet segment's access-port operational state. Remote-only segments are omitted; this is not forwarding health |
-| `frrk8s_evpn_es_df` | `esi` | Gauge 1 for local DF, 0 for local non-DF. Omitted while down, unready, bypassed, waiting for an election, or without an explicit role. Non-DF can be a healthy elected role |
-| `frrk8s_scrape_collector_success`, `_duration_seconds` | `collector` | Per collector: 1 if the read and parse were complete. A failed collector emits no other series |
-| `frrk8s_exporter_tls_config_current`, `frrk8s_exporter_tls_cert_not_after_timestamp_seconds` | | 0 if the last certificate or CA reload failed and the previous ones are still served; expiry of the server certificate |
-
-The names are kept for compatibility, so `promtool check metrics` flags the two `_total` gauges and
-the counters that lack a `_total` suffix.
-
-## Use
+Building requires Go 1.26 and make. Running requires FRR, `/usr/bin/vtysh`, access to FRR's sockets,
+and root or membership in FRR's `frrvty` group. The static binary can run beside FRR or inside its
+container; copying the binary alone does not supply those dependencies.
 
 ```sh
 make build
-./frr-metrics-exporter \
-  --listen 0.0.0.0:9141 \
-  --tls-cert-file server.crt --tls-key-file server.key \
-  --tls-client-ca-file scraper-ca.crt
 ```
 
-It must run where `/usr/bin/vtysh` reaches FRR's sockets, as root or in FRR's `frrvty` group: on
-the host with the FRR package, or in the FRR container image (the binary is static, so it can be
-mounted in or copied there).
-
-A Prometheus scrape job:
-
-```yaml
-scrape_configs:
-  - job_name: frr
-    scheme: https
-    tls_config:
-      ca_file: server-ca.crt
-      cert_file: scraper.crt
-      key_file: scraper.key
-      server_name: appliance.example.com   # must match the server certificate
-    static_configs:
-      - targets: ["appliance.example.com:9141"]
-```
-
-A throwaway CA with server and scraper certificates (see `hack/smoke.sh` for the same with
-`-days 1`); the server certificate needs a SAN matching what the scraper connects to:
+Use managed certificates for deployment. For a local demonstration, the following creates one
+CA and certificates for both exporter and scraper. Replace `appliance.example.com` consistently
+with the exporter's DNS name; its certificate SAN must match the scraper's connection name.
+Only the scraper needs `scraper.key`; keep the CA private key out of the running exporter.
+Each account must be able to read its certificate, key and CA files. Restrict private-key access
+and file replacement to trusted accounts.
 
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout ca.key -out ca.crt -days 365 -subj /CN=frr-ca
@@ -74,170 +29,163 @@ for n in server scraper; do
   printf 'subjectAltName=DNS:appliance.example.com\nextendedKeyUsage=serverAuth,clientAuth\n' > $n.ext
   openssl x509 -req -in $n.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out $n.crt -days 365 -extfile $n.ext
 done
+./frr-metrics-exporter --listen 0.0.0.0:9141 \
+  --tls-cert-file server.crt --tls-key-file server.key --tls-client-ca-file ca.crt
 ```
 
-| Flag | Meaning |
+From a separate shell, with the scraper's files:
+
+```sh
+curl --cacert ca.crt --cert scraper.crt --key scraper.key \
+  https://appliance.example.com:9141/metrics
+```
+
+A Prometheus scrape job (certificate paths are local to Prometheus):
+
+```yaml
+scrape_configs:
+  - job_name: frr
+    scheme: https
+    scrape_timeout: 10s
+    tls_config:
+      ca_file: ca.crt
+      cert_file: scraper.crt
+      key_file: scraper.key
+      server_name: appliance.example.com
+    static_configs:
+      - targets: ["appliance.example.com:9141"]
+```
+
+| Flag | Default / behavior |
 | --- | --- |
-| `--listen` | Default `127.0.0.1:9141`. Any other address needs `--tls-client-ca-file`; the exporter refuses to start otherwise. |
-| `--tls-cert-file`, `--tls-key-file` | Required. |
-| `--tls-client-ca-file` | Scrapers must present a certificate from this CA (mTLS). |
-| `--vtysh` | Default `/usr/bin/vtysh`. |
-| `--version` | Print the version and exit. |
-| `--collectors` | Default `bgp,bfd,evpn`. Drop one where FRR does not run that daemon: its read fails on every scrape, with `bfdd is not running` in the log and `success 0`. |
-| `--scrape-timeout` | Default `8s`: one deadline for all FRR reads in a scrape. Keep it below the scraper's timeout. |
+| `--listen` | `127.0.0.1:9141`; non-loopback listeners require a client CA. |
+| `--tls-cert-file`, `--tls-key-file` | Required server certificate and private key. |
+| `--tls-client-ca-file` | Optional on loopback; otherwise required. Enables client-certificate verification. |
+| `--vtysh` | `/usr/bin/vtysh`. |
+| `--collectors` | `bgp,bfd,evpn`; omit a collector when its FRR daemon is unavailable. |
+| `--scrape-timeout` | `8s`; positive deadline for FRR collection. Keep below the scraper's timeout. |
+| `--version` | Print build version and exit. |
 
-Behavior:
+## Metric contract
 
-- TLS 1.3 only; `/metrics` is the only path. No Kubernetes or basic authentication. With
-  `--tls-client-ca-file`, any certificate from that CA may scrape, so use a CA that issues only
-  scraper certificates.
-- The certificate, key and client CA are re-read when they change (checked at most once a second),
-  so rotation needs no restart. A rejected rotation, including a deleted or emptied CA file, keeps the
-  last good configuration, never turns client authentication off, logs once, and sets
-  `frrk8s_exporter_tls_config_current` to 0. Alert on that, and on the expiry series.
-  New server leaves must be currently valid and permit server authentication. Server certificate
-  and client CA files must contain complete certificate PEM blocks with LF or CRLF line endings,
-  separated by whitespace or `#` comments. Every block must parse; a damaged bundle is rejected.
-- Client-CA changes apply at TLS handshakes. A cached TLS session is rechecked, but an existing
-  authenticated connection keeps its access until closed; an active keep-alive connection can
-  persist indefinitely. Restart the exporter to terminate existing connections when removing
-  trust. Agree the deployment's revocation latency; file reload alone does not revoke them.
-- Each scrape reads FRR afresh with `show bgp vrf all neighbors json` (one command for every VRF),
-  `show bfd peers json` and `show bfd peers counters json`, and `show evpn vni json` plus
-  `show evpn es detail json`. The
-  collectors run at once, each with the whole deadline. Each `vtysh` connects only to the
-  command's daemon (`bgpd`, `bfdd` or `zebra`), so a stuck daemon cannot block unrelated reads
-  during CLI initialization.
-- The deadline is `--scrape-timeout`, lowered to 90% of the scraper's own timeout when Prometheus
-  announces it. A hung `vtysh` is killed at the deadline.
-  Use the direct executable or an `exec` wrapper: cancellation kills that process and bounds
-  inherited-pipe waiting, but does not manage descendants spawned by other wrappers.
-- At most four scrapes read FRR at once; read slots are released before writing. At most eight
-  handlers gather or write responses, bounding snapshots retained by slow readers. Requests
-  beyond either limit get `503` before reading FRR. Headers and request bodies have a three-second
-  read timeout; write deadlines alone cannot bound draining an incomplete request body.
-- A failed collector never leaves half a result: it emits nothing but its status. Collectors fail
-  on malformed output, including null replies, missing state or inventory identity, and invalid
-  counts. BFD joins the two reads by session ID and cross-checks the label identity; duplicate
-  IDs or identities fail. A session seen in only one read, or recreated between reads, fails the
-  whole BFD collector for that scrape. Independent collectors still report. If the exporter itself builds
-  inconsistent output (a duplicate series), the scrape fails with `500` rather than serving a subset.
-- EVPN uses two bulk reads, with one complete result: a failed ES read drops VNI and membership
-  metrics too. VTEP addresses and ESIs are normalized and duplicates rejected. A supplied VTEP
-  list must agree with its count when both are reported. Local ES operational state uses the
-  explicit flags array; a local access port without local flags fails collection. Valid implicit
-  MAC-only ES entries have no ownership flags or access port and emit no local state. FRR can print `df` on an unready or
-  bypassed segment, so the DF series also requires `readyForBgp`, `operUp`, no `bypass`, and
-  no pending `dfDelayTimer`. No role is inferred from a missing flag or a remote segment.
-- `SIGTERM` or `SIGINT` drains in-flight scrapes, cancels any still running after 5 seconds, waits
-  for their `vtysh` processes to die, and exits.
-- **Alert on `frrk8s_scrape_collector_success == 0` and on absent series, as well as on `up`.** If
-  FRR is down the exporter still answers `200`.
+Existing BGP names, types and labels follow frr-k8s's exporter. BFD expands upstream's `peer,vrf`
+identity with `local,interface,multihop`: update joins and expected-session inventory. Use target
+labels to distinguish sources. This does not replace every legacy `frr_exporter` series:
+FRR uptime and process/RIB/AS metadata are not carried over.
 
-## Verification
+All names below start with **`frrk8s_`**; braces denote literal alternatives. Unreported numeric counts
+produce no sample, never an invented zero. The BGP aggregate prefix gauges are the exception:
+they sum present counts across all families, including unmapped families, and emit 0 if none are reported.
 
-`make check` runs gofmt, vet and the race-enabled tests: parsers against real FRR 10.4.3 output
-(`collector/testdata/`, including peers in a VRF, IPv6 and unnumbered peers, down peers and a
-multihop BFD session), the edge cases
-above, mTLS and rotation, TLS reload health, the deadline and the scraper's timeout, the scrape
-slots, the `vtysh` runner (its output limit and kill-on-deadline), and shutdown cancelling a hung
-scrape. `make smoke` runs the exporter against two real FRR containers (BGP for IPv4 and
-EVPN, BFD, an L2 VNI with a learned MAC, an L3 VNI, and a peer that does not exist) and checks the
-series, that every collector succeeds, and that a scrape without a client certificate is refused.
-The exporters run as the image's `frr` user. The test adds LACP access bonds and a shared ESI,
-checks both peers' DF/non-DF metrics, changes preference to elect the other PE, and checks
-bypass, link down, remote-only state and VNI deletion. Each PE uses its own virtual CE bond;
-this verifies control-plane observations, not shared-CE forwarding or appliance HA.
-The test also freezes each daemon in turn and checks collector isolation, a three-second client
-budget, no surviving `vtysh`, and recovery. It needs podman, openssl, curl and Linux bonding
-(802.3ad). `SMOKE_DUMP=file` keeps the healthy scrape before fault injection. `make vuln` runs
-govulncheck (network access required).
+| Series suffix | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `bgp_session_up` | Gauge | `peer,vrf` | Established = 1, every other state = 0. An unnumbered peer uses its interface name. |
+| `bgp_{announced,received}_prefixes_total` | Gauge | `peer,vrf` | Prefixes summed across all address families. |
+| `bgp_family_{announced,received}_prefixes` | Gauge | `peer,vrf,afi,safi` | Per-family counts for `ipv4/unicast`, `ipv6/unicast`, `ipv4/vpn`, `l2vpn/evpn`. |
+| `bgp_opens_{sent,received}`, `bgp_notifications_sent`, `bgp_updates_{total,total_received}`, `bgp_keepalives_{sent,received}`, `bgp_route_refresh_sent`, `bgp_total_{sent,received}` | Counter | `peer,vrf` | BGP messages; UPDATE activity is a churn proxy, not changed-route counts. |
+| `bfd_session_up` | Gauge | `peer,vrf,local,interface,multihop` | Ordinary single-hop/multihop session: up = 1, otherwise 0. `peer` is an address, unlike unnumbered BGP. |
+| `bfd_{control,echo}_packet_{input,output}`, `bfd_session_{up,down}_events`, `bfd_zebra_notifications` | Counter | `peer,vrf,local,interface,multihop` | Packet, session-event and notification counts. |
+| `evpn_vni_info` | Gauge | `vni,vrf,type,interface` | 1 per observed VNI; inventory, not health. |
+| `evpn_{macs,neighbors,remote_vteps}` | Gauge | `vni,vrf` | L2-only MAC/ARP-ND occupancy and known VTEPs; not learning-event rates or reachability. |
+| `evpn_remote_vtep_present` | Gauge | `vni,vrf,vtep` | 1 per observed L2 membership. A missing list invents no members. |
+| `evpn_es_oper_up` | Gauge | `esi` | Local access-port state, 1/0; remote-only segments omitted. Not forwarding health. |
+| `evpn_es_df` | Gauge | `esi` | Applicable local role: DF = 1, non-DF = 0. Omitted while down, unready, bypassed, pending election or without an explicit role. Non-DF can be healthy. |
+| `scrape_collector_{success,duration_seconds}` | Gauge | `collector` | Success = 1 for complete collection, otherwise 0; duration is elapsed seconds. |
+| `exporter_tls_config_current` | Gauge | None | 1 when served configuration matches the files; 0 after a rejected reload. |
+| `exporter_tls_cert_not_after_timestamp_seconds` | Gauge | None | Served server certificate's expiry, as Unix seconds. |
 
-Upstream FRR 10.4.3/10.6.2 smoke runs passed; the pinned Red Hat payload was rechecked with the
-CRLF correction in `c8a1144`:
+Compatibility names mean `promtool check metrics` flags the two prefix `_total` gauges and
+counters without a `_total` suffix. Membership adds one series per L2 VNI/VTEP pair; ES adds at
+most two per local ESI. No per-MAC, per-IP-neighbor or per-route series are exported.
+
+## Access and failure behavior
+
+TLS 1.3 is required. There is no Kubernetes or basic authentication. With a client CA configured,
+any valid client certificate from that CA may scrape; use a CA dedicated to scrapers. Without
+mTLS, listen on loopback, for example behind a separately authenticated proxy.
+
+Certificates, keys and client CAs are checked at most once a second, on handshakes or scrapes.
+Server leaves must be currently valid and permit server authentication. Certificate files accept
+LF/CRLF PEM and `#` comments; every block must parse. Invalid startup files prevent serving.
+A rejected rotation keeps the last good configuration, preserves authentication, logs the failure
+and sets `frrk8s_exporter_tls_config_current` to 0. Alert on reload health and certificate expiry.
+CA changes apply to new TLS connections, including resumed sessions. Existing authenticated
+connections keep access until closed; restart the exporter for immediate removal of their trust.
+Certificate revocation lists are not supported.
+
+Every scrape collects afresh; collectors run concurrently against their own FRR daemons. A
+malformed or incomplete result discards that collector's data, retaining only success/duration
+gauges; independent collectors still report. BFD's two reads must match by session ID and full
+identity, so recreation between reads fails BFD collection. Named/SBFD modes are rejected until
+their identity is qualified. EVPN VNI and ES reads form one result: an ES failure drops VNI metrics too.
+Inconsistent exporter output fails the entire scrape with `500`.
+
+**HTTP `200` and Prometheus `up` do not prove FRR health.** Alert on collector failure and missing
+expected objects/measurements as well as scrape failure. Optional fields and inapplicable DF roles
+can legitimately be absent; interpret absence against configuration and collector status.
+
+Collection uses the configured deadline, reduced to 90% of Prometheus's announced timeout when
+smaller. A hung `vtysh` is killed. Use its direct executable or an `exec` wrapper; cancellation does
+not manage arbitrary wrapper descendants. Each reply is capped at 32 MiB, which bounds input,
+not total memory or supported scale.
+
+At most four scrapes read FRR simultaneously and eight handlers gather/write responses.
+Excess requests receive `503` before CLI work. Headers/bodies have a three-second read timeout;
+the write budget is the configured scrape timeout plus five seconds. TLS closure can add five
+more seconds. Admission bounds concurrency, not a fixed memory allowance.
+`SIGTERM`/`SIGINT` allow five seconds to drain, then cancel remaining reads and wait for their
+`vtysh` processes to terminate before exit.
+
+## Verification and qualification
+
+| Command | Coverage / prerequisites |
+| --- | --- |
+| `make check` | gofmt, vet and race-enabled parser/server tests, using [real fixtures and provenance](collector/testdata/README.md). |
+| `make build` | Static binary using Go's crypto. |
+| `make vuln` | govulncheck; needs network access. |
+| `make smoke` | Two real FRR containers: BGP/BFD/EVPN, DF transitions, mTLS and daemon-hang recovery; needs podman, openssl, curl and Linux bonding. |
+| `make build && python3 hack/load.py` | Full binary/subprocess/mTLS/text/gzip replay with two scrapers, stalled readers, CPU/RSS and recovery; needs Linux, Python 3 and openssl. |
+
+Upstream FRR 10.4.3/10.6.2 smoke runs passed. The pinned Red Hat payload was rechecked at
+`c8a1144`, running the exporter as its `frr` user:
 
 ```sh
 FRR_IMAGE=registry.redhat.io/openshift4/frr-rhel9@sha256:82fd7cc0123f6286bad46231a9939799ae79c30b9369047d2ffd109dacefa76e make smoke
 ```
 
-That image contains RHEL 9.8 `frr10-10.4.3-3.el9_8.2`; the exporter runs as its `frr` user.
-These are local rootless-container checks on a Fedora host, including the Red Hat package;
-they do not qualify the RHEL 10 appliance, its SELinux policy, architectures or FIPS build.
+It contains RHEL 9.8 `frr10-10.4.3-3.el9_8.2`. These are rootless-container checks on Fedora,
+not appliance qualification. `SMOKE_DUMP=file` saves the healthy scrape. Scripts are the source
+for test mechanics; captures and generated scale data are distinguished in fixture provenance.
 
-Complete scrape cost is measured with `make build && python3 hack/load.py` (Linux, Python 3,
-openssl). It runs the actual binary restricted to two logical CPUs with `GOMAXPROCS=2`, subprocess
-fixture replay, mTLS, registry gathering, text/gzip encoding and full response validation. The load is
-2,000 BGP neighbors, 64 L2 VNIs × 256 VTEPs, one BFD session and one local ES: 50,658 `frrk8s_*`
-samples plus Go/process metrics. Each scraper requests once per second, ten times per phase; stalled
-clients request 4 KiB socket receive buffers and stop after response headers. This measures exporter cost;
-real FRR query time and remote network latency still need qualification at the declared scale.
+Measured on 2026-11-02, i7-8665U Linux amd64, 16 GiB RAM, Go 1.26.10; exporter restricted to
+two logical CPUs. Response maxima below describe these runs, not latency guarantees.
 
-Measured at `c8a1144` on 2026-11-02, i7-8665U Linux amd64 (16 GiB RAM, Go 1.26.10), restricted to two
-logical CPUs; memory was not constrained. CPU includes exporter and replay subprocess time.
-RSS peaks are the exporter's cumulative kernel high-water mark, not Go heap allocation counts.
+| Evidence | Scale | Result |
+| --- | --- | --- |
+| Fixture replay, `c8a1144` | 2,000 BGP peers, 64 L2 VNIs × 256 VTEPs, one BFD session/local ES; 50,658 `frrk8s_*` samples plus Go/process metrics | Two gzip scrapers: 20 scrapes/10 s, 10.64 CPU s, maximum 0.67 s; with two stalled readers, maximum 0.68 s. Plain/gzip bodies: 3.82 MB/156 kB. |
+| Replay overload/recovery, same revision | Eight stalled responses; ninth rejected without CLI work | Recovery 10.5 s; peak RSS 362 MiB, then 160 MiB after recovery/idle. |
+| Live pinned Red Hat FRR, `26d27f7` | 2,000 neighbors (one Established), 64 L2 VNIs × one VTEP, one L3 VNI/BFD session; no local ES | Two gzip scrapers: maximum 1.26 s, or 0.71 s with two stalled readers. Exporter RSS peak 108 MiB; whole-container memory peak 478 MiB under a 1 GiB limit. |
 
-| Load | CPU seconds / 20 scrapes | Maximum response | Peak RSS |
-| --- | ---: | ---: | ---: |
-| Two scrapers, plain text | 10.19 | 0.61 s | 177 MiB |
-| Two scrapers, gzip | 10.64 | 0.67 s | 178 MiB |
-| Two gzip scrapers plus two stalled readers | 11.00 | 0.68 s | 275 MiB |
-| Two gzip scrapers after recovery | 10.49 | 0.63 s | 362 MiB |
-
-Plain responses were 3.82 MB, gzip 156 kB. With all eight response slots stalled, a ninth request
-returned `503` without CLI work; a complete scrape recovered 10.5 seconds after rejection. Peak
-RSS reached 362 MiB, then fell to 160 MiB during the post-recovery scrape phase and stayed there
-through five idle seconds. Write deadlines include five seconds beyond the configured scrape
-timeout; TLS closure can add up to five more seconds. Admission bounds concurrency, not a fixed
-memory allowance.
-
-An additional live test at `26d27f7` used the pinned Red Hat image: 2,000 BGP neighbors (one Established),
-64 L2 VNIs with one VTEP each, one L3 VNI and one BFD session, without local ESs. With the
-exporter restricted to two logical CPUs and its router container limited to 1 GiB, two gzip scrapers
-completed 20 scrapes in 10.27 seconds (maximum 1.26 s); with two stalled readers, 10.00 seconds
-(maximum 0.71 s). Exporter/CLI CPU was 9.35/8.08 seconds per phase, peak exporter RSS 108 MiB.
-Whole-container CPU, including FRR JSON generation, was 12.67/11.05 seconds; cgroup memory
-peaked at 478 MiB, including file cache. After stalled clients disconnected, two complete scrapes
-took 0.86 seconds. Live FRR at 256 VTEPs per VNI remains unqualified.
-
-## Design notes
-
-- `collector/` is the whole FRR side: `Collector`s that turn `vtysh` output into metrics, and the
-  `Vtysh` runner. It has no HTTP, TLS or flags, and the layout mirrors frr-k8s's
-  `cmd/metrics/collector`; it can be ported independently of this server.
-
-- TLS uses `crypto/tls` (`tls.go`), with certificate and CA files supplied through flags.
-- Each FRR reply is capped at 32 MiB; this bounds input, not the parsed snapshot or encoded response.
-- Membership adds one series per observed L2 VNI/VTEP pair, not per BGP peer: a relay can
-  advertise many VTEPs. ES metrics add at most two series per local ESI. No per-MAC, per-IP
-  neighbor or route labels are exported.
+Replay includes exporter/subprocess work, gathering, encoding, complete response reading and
+collector-success/sample-count checks;
+it excludes FRR JSON-generation cost and remote network latency. Its CPU includes replay children;
+RSS peak is cumulative process high-water memory, not heap allocation. Live container memory
+includes FRR and file cache. Live FRR at 256 VTEPs per VNI remains unqualified.
 
 ## Limits
 
-- This is a standalone candidate and a source of tested collectors, not a qualified appliance
-  payload. CORENET-7504/7505 currently require the frr-k8s binary; shipping a replacement needs
-  amended criteria and agreed build, update and security ownership. Rootful RHEL 10 with SELinux,
-  the selected release image and platforms, socket sharing, appliance lifecycle and the remote
-  scrape path remain to be qualified. Local container tests do not establish those properties.
-- All named FRR series in the EGA planning table are implemented. The rest of CORENET-7504
-  needs other sources: node-exporter for appliance/interface/bandwidth observations,
-  CloudWatch for AWS DX/VPN state, and an agreed continuous probe for forwarding/latency.
-  MAC occupancy is not a learning-event rate; BGP UPDATE counts are not changed-route counts.
-  Per-VTEP membership is optional follow-on coverage enabled in this reference; its shipping
-  default and expected-specific alert policy remain unselected.
-- BFD RTT remains unexported: FRR 10.4.3's echo-window fields report zero without samples,
-  supply no sample age, and its CLI caps the minimum at 1000 microseconds. They cannot establish
-  general BFD or transport latency ([FRR's CLI producer](https://github.com/FRRouting/frr/blob/frr-10.4.3/bfdd/bfdd_vty.c)). The plan leaves the latency source undecided. Certificate
-  revocation lists are also not implemented.
-- BFD supports ordinary single-hop and multihop sessions. Named/SBFD modes are rejected until
-  their identity contract is qualified; a lone named path must not satisfy ordinary BFD health.
-  Any sessions that collide on the current labels also fail collection.
-- `make build` makes a static binary with Go's own crypto. A FIPS-validated build needs your
-  distribution's Go toolchain.
-- Building needs Go 1.26 (set by the `golang.org/x` dependencies). Only the FRR versions above are exercised. JSON shapes differ between releases; check new ones
-  with `make smoke` (`FRR_IMAGE=...`).
-- Where FRR omits a field, the series is omitted, never reported as 0; the `_total` BGP gauges are
-  the exception because they sum whatever is present.
+This candidate does not establish appliance readiness: selected-image/build/update/security
+ownership, rootful RHEL 10/SELinux, FIPS, target platforms, socket sharing, lifecycle and remote
+scraping need qualification. A static build using ordinary Go crypto is not a FIPS-validated build.
+Check new FRR releases with `FRR_IMAGE=... make smoke`; JSON shapes vary.
+
+All named FRR series in the EVPN Gateway Appliance (EGA) plan are implemented. Expected-inventory lifecycle, appliance
+and interface signals, AWS state, dashboards and forwarding/latency probes belong to deployment
+and other sources. Membership and route counts do not prove forwarding; BFD RTT remains
+unexported pending a trustworthy latency source. EGA's current acceptance criteria require the
+frr-k8s binary; using this candidate requires amended criteria. Delivery choice and per-VTEP
+shipping policy remain open.
 
 ## License
 
-Apache-2.0.
+Apache-2.0. Existing BGP metric compatibility follows the Apache-2.0 MetalLB/frr-k8s exporter.
