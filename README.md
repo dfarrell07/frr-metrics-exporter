@@ -96,8 +96,8 @@ Behavior:
   last good configuration, never turns client authentication off, logs once, and sets
   `frrk8s_exporter_tls_config_current` to 0. Alert on that, and on the expiry series.
   New server leaves must be currently valid and permit server authentication. Server certificate
-  and client CA files must contain complete certificate PEM blocks, with whitespace or `#` comments between them;
-  one valid root does not excuse another damaged block in the bundle.
+  and client CA files must contain complete certificate PEM blocks with LF or CRLF line endings,
+  separated by whitespace or `#` comments. Every block must parse; a damaged bundle is rejected.
 - Client-CA changes apply at TLS handshakes. A cached TLS session is rechecked, but an existing
   authenticated connection keeps its access until closed; an active keep-alive connection can
   persist indefinitely. Restart the exporter to terminate existing connections when removing
@@ -153,7 +153,8 @@ budget, no surviving `vtysh`, and recovery. It needs podman, openssl, curl and L
 (802.3ad). `SMOKE_DUMP=file` keeps the healthy scrape before fault injection. `make vuln` runs
 govulncheck (network access required).
 
-The full smoke passes with upstream FRR 10.4.3/10.6.2 and with the EGA-pinned Red Hat payload:
+Upstream FRR 10.4.3/10.6.2 smoke runs passed; the pinned Red Hat payload was rechecked with the
+CRLF correction in `c8a1144`:
 
 ```sh
 FRR_IMAGE=registry.redhat.io/openshift4/frr-rhel9@sha256:82fd7cc0123f6286bad46231a9939799ae79c30b9369047d2ffd109dacefa76e make smoke
@@ -171,25 +172,25 @@ samples plus Go/process metrics. Each scraper requests once per second, ten time
 clients request 4 KiB socket receive buffers and stop after response headers. This measures exporter cost;
 real FRR query time and remote network latency still need qualification at the declared scale.
 
-Measured 2026-11-02 on an i7-8665U Linux amd64 host (16 GiB RAM, Go 1.26.10), restricted to two
+Measured at `c8a1144` on 2026-11-02, i7-8665U Linux amd64 (16 GiB RAM, Go 1.26.10), restricted to two
 logical CPUs; memory was not constrained. CPU includes exporter and replay subprocess time.
 RSS peaks are the exporter's cumulative kernel high-water mark, not Go heap allocation counts.
 
 | Load | CPU seconds / 20 scrapes | Maximum response | Peak RSS |
 | --- | ---: | ---: | ---: |
-| Two scrapers, plain text | 10.20 | 0.61 s | 176 MiB |
-| Two scrapers, gzip | 10.71 | 0.61 s | 179 MiB |
-| Two gzip scrapers plus two stalled readers | 11.36 | 0.68 s | 284 MiB |
-| Two gzip scrapers after recovery | 10.85 | 0.63 s | 389 MiB |
+| Two scrapers, plain text | 10.19 | 0.61 s | 177 MiB |
+| Two scrapers, gzip | 10.64 | 0.67 s | 178 MiB |
+| Two gzip scrapers plus two stalled readers | 11.00 | 0.68 s | 275 MiB |
+| Two gzip scrapers after recovery | 10.49 | 0.63 s | 362 MiB |
 
 Plain responses were 3.82 MB, gzip 156 kB. With all eight response slots stalled, a ninth request
-returned `503` without CLI work; a complete scrape recovered 10.2 seconds after rejection. Peak
-RSS reached 389 MiB, then fell to 157 MiB during the post-recovery scrape phase and stayed there
+returned `503` without CLI work; a complete scrape recovered 10.5 seconds after rejection. Peak
+RSS reached 362 MiB, then fell to 160 MiB during the post-recovery scrape phase and stayed there
 through five idle seconds. Write deadlines include five seconds beyond the configured scrape
 timeout; TLS closure can add up to five more seconds. Admission bounds concurrency, not a fixed
 memory allowance.
 
-An additional live test used the pinned Red Hat image: 2,000 BGP neighbors (one Established),
+An additional live test at `26d27f7` used the pinned Red Hat image: 2,000 BGP neighbors (one Established),
 64 L2 VNIs with one VTEP each, one L3 VNI and one BFD session, without local ESs. With the
 exporter restricted to two logical CPUs and its router container limited to 1 GiB, two gzip scrapers
 completed 20 scrapes in 10.27 seconds (maximum 1.26 s); with two stalled readers, 10.00 seconds
