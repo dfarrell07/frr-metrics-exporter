@@ -10,12 +10,16 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
+	"io"
 	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -26,6 +30,55 @@ import (
 )
 
 var discard = slog.New(slog.DiscardHandler)
+
+func TestSmokeOnlyCleansResourcesItOwns(t *testing.T) {
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"go":      "exit 0",
+		"openssl": "exit 0",
+		"podman": `printf '%s\n' "$*" >> "$SMOKE_TEST_LOG"
+if [ "$1" = network ] && [ "$2" = create ] && [ "$SMOKE_TEST_FAIL_AT" = network ]; then exit 1; fi
+if [ "$1" = run ] || [ "$1" = rm ]; then exit 1; fi`,
+	} {
+		path := filepath.Join(dir, name)
+		write(t, path, []byte("#!/bin/sh\n"+body+"\n"))
+		if err := os.Chmod(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var previous string
+	for _, failAt := range []string{"network", "network", "run"} {
+		log := filepath.Join(t.TempDir(), "podman.log")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cmd := exec.CommandContext(ctx, "bash", "hack/smoke.sh")
+		cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "SMOKE_TEST_LOG="+log, "SMOKE_TEST_FAIL_AT="+failAt)
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if err == nil || ctx.Err() == context.DeadlineExceeded {
+			t.Fatalf("smoke: error %v, output %s", err, out)
+		}
+		calls, err := os.ReadFile(log)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+		if !strings.HasPrefix(lines[0], "network create ") {
+			t.Fatalf("network creation not attempted: %s", calls)
+		}
+		if failAt == "network" && len(lines) != 1 {
+			t.Fatalf("failed network creation attempted cleanup of unowned resources: %s", calls)
+		}
+		fields := strings.Fields(lines[0])
+		name := fields[len(fields)-1]
+		if !strings.HasPrefix(name, "egasmoke-") || name == previous {
+			t.Fatalf("smoke reused a resource name: %q", name)
+		}
+		previous = name
+		if failAt == "run" && (len(lines) != 4 || !strings.HasPrefix(lines[1], "run ") || lines[2] != "rm -f "+name+"-r1 "+name+"-r2" || lines[3] != "network rm -f "+name) {
+			t.Fatalf("partial startup did not finish owned-resource cleanup: %s", calls)
+		}
+	}
+}
 
 // pki issues certificates from one throwaway CA.
 type pki struct {
@@ -51,7 +104,7 @@ func newPKI(t *testing.T) *pki {
 }
 
 // issue returns PEM cert and key for cn, usable as server (127.0.0.1) and client.
-func (p *pki) issue(t *testing.T, cn string, serial int64) (certPEM, keyPEM []byte) {
+func (p *pki) issue(t *testing.T, cn string, serial int64, modify ...func(*x509.Certificate)) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	tmpl := &x509.Certificate{
@@ -60,6 +113,9 @@ func (p *pki) issue(t *testing.T, cn string, serial int64) (certPEM, keyPEM []by
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	for _, change := range modify {
+		change(tmpl)
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, p.ca, &key.PublicKey, p.caKey)
 	if err != nil {
@@ -81,13 +137,14 @@ func write(t *testing.T, path string, data []byte) {
 // checks the server exits cleanly.
 func start(t *testing.T, c config) (string, func()) {
 	t.Helper()
+	c.grace = time.Second
 	l, _ := net.Listen("tcp", "127.0.0.1:0")
 	c.listen = l.Addr().String()
 	l.Close()
-	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
+	e := newExporter(quiet, time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, &tlsSource{cfg: c, logger: discard}, h, discard) }()
+	go func() { done <- run(ctx, &tlsSource{cfg: c, logger: discard}, e, discard) }()
 	for i := 0; i < 100; i++ {
 		if conn, err := net.Dial("tcp", c.listen); err == nil {
 			conn.Close()
@@ -134,6 +191,9 @@ func TestMutualTLSAndRotation(t *testing.T) {
 	roots.AddCert(p.ca)
 	cc, ck := p.issue(t, "scraper", 3)
 	clientPair, _ := tls.X509KeyPair(cc, ck)
+	if _, err := get(addr, &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{clientPair}, MaxVersion: tls.VersionTLS12}); err == nil {
+		t.Error("TLS 1.2 was accepted")
+	}
 
 	if _, err := get(addr, &tls.Config{RootCAs: roots}); err == nil {
 		t.Error("a client without a certificate was served")
@@ -224,9 +284,72 @@ func TestCheckListen(t *testing.T) {
 	}
 }
 
+func TestMetricsRoute(t *testing.T) {
+	p, dir := newPKI(t), t.TempDir()
+	crt, key := p.issue(t, "server", 2)
+	cfg := config{certFile: filepath.Join(dir, "tls.crt"), keyFile: filepath.Join(dir, "tls.key")}
+	write(t, cfg.certFile, crt)
+	write(t, cfg.keyFile, key)
+	addr, stop := start(t, cfg)
+	defer stop()
+	roots := x509.NewCertPool()
+	roots.AddCert(p.ca)
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}, Timeout: time.Second}
+	defer client.CloseIdleConnections()
+	for path, want := range map[string]int{"/metrics": http.StatusOK, "/": http.StatusNotFound, "/metrics/": http.StatusNotFound} {
+		resp, err := client.Get("https://" + addr + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("%s: status %d, want %d", path, resp.StatusCode, want)
+		}
+	}
+}
+
+func TestServerBoundsIncompleteRequestBodies(t *testing.T) {
+	p, dir := newPKI(t), t.TempDir()
+	crt, key := p.issue(t, "server", 2)
+	cfg := config{certFile: filepath.Join(dir, "tls.crt"), keyFile: filepath.Join(dir, "tls.key"), timeout: time.Minute, grace: time.Second}
+	write(t, cfg.certFile, crt)
+	write(t, cfg.keyFile, key)
+	addr, stop := start(t, cfg)
+	defer stop()
+	roots := x509.NewCertPool()
+	roots.AddCert(p.ca)
+	client, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: roots})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	// Outlast the server's read budget, but not its much longer write budget.
+	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(client, "GET /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, client); err != nil {
+		if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+			t.Fatal("incomplete request body outlived the server read budget")
+		}
+	}
+}
+
 // A scrape still running when the grace period ends is cancelled, which is what
 // kills its vtysh, and run reports that it did not drain.
 func TestShutdownCancelsScrapesAfterGrace(t *testing.T) {
+	for _, body := range []bool{false, true} {
+		name := "ordinary GET"
+		if body {
+			name = "incomplete request body"
+		}
+		t.Run(name, func(t *testing.T) { testShutdownCancelsScrapesAfterGrace(t, body) })
+	}
+}
+
+func testShutdownCancelsScrapesAfterGrace(t *testing.T, body bool) {
 	p, dir := newPKI(t), t.TempDir()
 	crt, key := p.issue(t, "server", 2)
 	cfg := config{certFile: filepath.Join(dir, "tls.crt"), keyFile: filepath.Join(dir, "tls.key"), grace: 200 * time.Millisecond}
@@ -239,15 +362,21 @@ func TestShutdownCancelsScrapesAfterGrace(t *testing.T) {
 	started, cancelled := make(chan struct{}), make(chan struct{})
 	e := newExporter(func(ctx context.Context, _ string) ([]byte, error) {
 		close(started)
-		<-ctx.Done()                       // a hung vtysh
+		<-ctx.Done() // a hung vtysh
+		if ctx.Err() != context.Canceled {
+			t.Error("read ended at its own deadline instead of shutdown cancellation")
+		}
 		time.Sleep(300 * time.Millisecond) // taking its time to die
 		close(cancelled)
 		return nil, ctx.Err()
-	}, time.Minute)
+	}, 3*time.Second)
 	e.cs = e.cs[:1]
 
 	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
 	done := make(chan error, 1)
+	// run owns routing as well as shutdown, so main cannot hide the exporter's
+	// Wait behind a handler wrapper.
 	go func() { done <- run(ctx, &tlsSource{cfg: cfg, logger: discard}, e, discard) }()
 	roots := x509.NewCertPool()
 	roots.AddCert(p.ca)
@@ -258,9 +387,27 @@ func TestShutdownCancelsScrapesAfterGrace(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// A client that outlasts the test, so only the server can cut the scrape off.
-	patient := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}, Timeout: time.Minute}
-	go patient.Get("https://" + cfg.listen + "/") //nolint:errcheck // the scrape is cut off by design
+	// A patient client cannot hide a missing server cancellation path.
+	var incomplete *tls.Conn
+	if body {
+		conn, err := tls.Dial("tcp", cfg.listen, &tls.Config{RootCAs: roots})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		incomplete = conn
+		if _, err := io.WriteString(conn, "GET /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n"); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		patient := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}, Timeout: time.Minute}
+		defer patient.CloseIdleConnections()
+		go func() {
+			if resp, err := patient.Get("https://" + cfg.listen + "/metrics"); err == nil {
+				resp.Body.Close()
+			}
+		}()
+	}
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
@@ -280,6 +427,14 @@ func TestShutdownCancelsScrapesAfterGrace(t *testing.T) {
 	case <-cancelled:
 	default:
 		t.Error("run returned before the in-flight read was cancelled")
+	}
+	if incomplete != nil {
+		incomplete.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		if _, err := io.Copy(io.Discard, incomplete); err != nil {
+			if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+				t.Error("run returned without closing the incomplete request's connection")
+			}
+		}
 	}
 }
 
@@ -378,5 +533,228 @@ func TestTLSFilesAreReadAtMostOncePerRecheck(t *testing.T) {
 	write(t, cfg.keyFile, key)
 	if again, _ := src.get(nil); again != first {
 		t.Error("files were re-read inside the recheck interval")
+	}
+}
+
+func TestClientCARotationForReusedAndResumedConnections(t *testing.T) {
+	p, dir := newPKI(t), t.TempDir()
+	cfg := config{certFile: filepath.Join(dir, "tls.crt"), keyFile: filepath.Join(dir, "tls.key"), clientCAFile: filepath.Join(dir, "ca.crt")}
+	crt, key := p.issue(t, "server", 2)
+	write(t, cfg.certFile, crt)
+	write(t, cfg.keyFile, key)
+	write(t, cfg.clientCAFile, p.pem)
+	addr, stop := start(t, cfg)
+	defer stop()
+	roots := x509.NewCertPool()
+	roots.AddCert(p.ca)
+	cc, ck := p.issue(t, "scraper", 3)
+	pair, err := tls.X509KeyPair(cc, ck)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc := &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{pair}, ClientSessionCache: tls.NewLRUClientSessionCache(4)}
+	tr := &http.Transport{TLSClientConfig: tc}
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	defer client.CloseIdleConnections()
+	scrape := func(client *http.Client) (tls.ConnectionState, bool, error) {
+		reused := false
+		trace := &httptrace.ClientTrace{GotConn: func(c httptrace.GotConnInfo) { reused = c.Reused }}
+		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), http.MethodGet, "https://"+addr+"/metrics", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return tls.ConnectionState{}, reused, err
+		}
+		defer resp.Body.Close()
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("scrape status = %d, want 200", resp.StatusCode)
+		}
+		return *resp.TLS, reused, nil
+	}
+	if state, _, err := scrape(client); err != nil || state.DidResume {
+		t.Fatalf("initial handshake: resumed=%v, err=%v", state.DidResume, err)
+	}
+	client.CloseIdleConnections()
+	if state, reused, err := scrape(client); err != nil || reused || !state.DidResume {
+		t.Fatalf("resumption baseline: reused=%v, resumed=%v, err=%v", reused, state.DidResume, err)
+	}
+	// Replacing the CA applies to new TLS connections, including resumption.
+	write(t, cfg.clientCAFile, newPKI(t).pem)
+	fresh := &http.Client{Transport: &http.Transport{TLSClientConfig: tc.Clone()}, Timeout: 5 * time.Second}
+	defer fresh.CloseIdleConnections()
+	if _, _, err := scrape(fresh); err == nil {
+		t.Fatal("old client was accepted on a new TLS connection after CA replacement")
+	}
+	// Existing connections retain the authentication established at their handshake.
+	if _, reused, err := scrape(client); err != nil || !reused {
+		t.Fatalf("existing connection after CA replacement: reused=%v, err=%v", reused, err)
+	}
+}
+
+func TestTLSCertificateFilesRejectEveryDamagedBlock(t *testing.T) {
+	p, q := newPKI(t), newPKI(t)
+	crt, key := p.issue(t, "server", 2)
+	for _, file := range []string{"server", "client CA"} {
+		first, second := string(p.pem), string(q.pem)
+		if file == "server" {
+			first, second = string(crt), string(p.pem)
+		}
+		badPEM := "-----BEGIN CERTIFICATE-----\n!invalid-base64!\n-----END CERTIFICATE-----\n"
+		truncated := "-----BEGIN CERTIFICATE-----\nMIIB"
+		badDER := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("invalid DER")}))
+		cases := map[string]string{
+			"garbage prefix":      "garbage\n" + first,
+			"garbage middle":      first + "garbage\n" + second,
+			"garbage trailer":     first + "garbage\n",
+			"malformed prefix":    badPEM + first,
+			"malformed middle":    first + badPEM + second,
+			"malformed trailer":   first + badPEM,
+			"truncated prefix":    truncated + "\n" + first,
+			"truncated middle":    first + truncated + "\n" + second,
+			"truncated trailer":   first + truncated,
+			"invalid DER prefix":  badDER + first,
+			"invalid DER middle":  first + badDER + second,
+			"invalid DER trailer": first + badDER,
+			"empty":               "",
+			"comments only":       "# not a certificate\n",
+		}
+		for name, bundle := range cases {
+			t.Run(file+"/"+name, func(t *testing.T) {
+				dir := t.TempDir()
+				c := config{certFile: filepath.Join(dir, "cert"), keyFile: filepath.Join(dir, "key"), clientCAFile: filepath.Join(dir, "ca")}
+				write(t, c.certFile, crt)
+				if file == "server" {
+					write(t, c.certFile, []byte(first+second))
+				}
+				write(t, c.keyFile, key)
+				write(t, c.clientCAFile, append(append([]byte{}, p.pem...), q.pem...))
+				src := &tlsSource{cfg: c, logger: discard}
+				good, err := src.get(nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				path := c.clientCAFile
+				if file == "server" {
+					path = c.certFile
+				}
+				write(t, path, []byte(bundle))
+				got, err := src.get(nil)
+				if err != nil || got != good {
+					t.Fatalf("damaged bundle replaced last-good config: err=%v", err)
+				}
+				if v := gauge(t, src, "frrk8s_exporter_tls_config_current"); v != 0 {
+					t.Fatalf("reload health=%v, want 0", v)
+				}
+			})
+		}
+	}
+}
+
+func TestTLSClientCABundleAllowsComments(t *testing.T) {
+	p, q := newPKI(t), newPKI(t)
+	bundle := " \n# first root\n\t" + string(p.pem) + "\n \t# second root, literal -----BEGIN CERTIFICATE-----\n" + string(q.pem) + "\n# end without newline"
+	pool, err := clientCAPool([]byte(bundle))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pool.Subjects()) != 2 {
+		t.Fatalf("got %d roots, want 2", len(pool.Subjects()))
+	}
+}
+
+func TestTLSServerCertificatePolicyAndRecovery(t *testing.T) {
+	p := newPKI(t)
+	for name, tc := range map[string]struct {
+		modify func(*x509.Certificate)
+		valid  bool
+	}{
+		"future": {func(c *x509.Certificate) {
+			c.NotBefore = time.Now().Add(time.Hour)
+			c.NotAfter = time.Now().Add(2 * time.Hour)
+		}, false},
+		"expired": {func(c *x509.Certificate) {
+			c.NotBefore = time.Now().Add(-2 * time.Hour)
+			c.NotAfter = time.Now().Add(-time.Hour)
+		}, false},
+		"client only": {func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth} }, false},
+		"unknown only": {func(c *x509.Certificate) {
+			c.ExtKeyUsage = nil
+			c.UnknownExtKeyUsage = []asn1.ObjectIdentifier{{1, 2, 3, 4}}
+		}, false},
+		"absent usage": {func(c *x509.Certificate) { c.ExtKeyUsage = nil }, true},
+		"any usage":    {func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageAny} }, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := config{certFile: filepath.Join(dir, "cert"), keyFile: filepath.Join(dir, "key")}
+			cert, key := p.issue(t, "good", 2)
+			write(t, cfg.certFile, cert)
+			write(t, cfg.keyFile, key)
+			src := &tlsSource{cfg: cfg, logger: discard}
+			good, err := src.get(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate, candidateKey := p.issue(t, "candidate", 3, tc.modify)
+			if _, err := build(string(candidate), string(candidateKey), "", false); (err == nil) != tc.valid {
+				t.Fatalf("startup validity: error=%v, want valid=%v", err, tc.valid)
+			}
+			write(t, cfg.certFile, candidate)
+			write(t, cfg.keyFile, candidateKey)
+			got, err := src.get(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 0.0
+			if tc.valid {
+				want = 1
+				if got == good {
+					t.Error("valid replacement was not installed")
+				}
+			} else if got != good {
+				t.Error("unusable certificate replaced last-good configuration")
+			}
+			if v := gauge(t, src, "frrk8s_exporter_tls_config_current"); v != want {
+				t.Errorf("reload health=%v, want %v", v, want)
+			}
+			write(t, cfg.certFile, cert)
+			write(t, cfg.keyFile, key)
+			if v := gauge(t, src, "frrk8s_exporter_tls_config_current"); v != 1 {
+				t.Errorf("recovery health=%v, want 1", v)
+			}
+		})
+	}
+}
+
+func TestTLSDoesNotRequireKeyPairLeafCache(t *testing.T) {
+	t.Setenv("GODEBUG", "x509keypairleaf=0")
+	p := newPKI(t)
+	cert, key := p.issue(t, "server", 2)
+	cfg, err := build(string(cert), string(key), "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Certificates[0].Leaf == nil {
+		t.Fatal("parsed server leaf is missing")
+	}
+}
+
+func TestTLSServesEveryValidatedCertificateBlock(t *testing.T) {
+	p := newPKI(t)
+	cert, key := p.issue(t, "server", 2)
+	for _, gap := range []string{"", "\n\t", "\n# intermediate\n\t"} {
+		cfg, err := build(gap+string(cert)+gap+string(p.pem), string(key), "", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chain := cfg.Certificates[0].Certificate
+		if len(chain) != 2 || string(chain[1]) != string(p.ca.Raw) {
+			t.Fatalf("gap %q: served chain does not contain every validated certificate", gap)
+		}
 	}
 }

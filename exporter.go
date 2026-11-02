@@ -15,19 +15,27 @@ import (
 	"github.com/dfarrell07/frr-metrics-exporter/collector"
 )
 
-// exporter answers each scrape with a fresh read of FRR bounded by one
-// deadline. A scrape holds one of a few slots only while it reads FRR, never
-// while the response is written, and scrapes beyond the slots get 503.
+// exporter bounds FRR reads and response work separately. Read slots are free
+// while other clients receive their responses; a second limit bounds retained
+// snapshots and writers. Requests beyond either budget get 503.
 type exporter struct {
-	run     collector.Runner
-	cs      []collector.Collector
-	timeout time.Duration // upper bound; the scraper's own timeout can lower it
-	base    prometheus.Gatherer
-	sem     chan struct{}
-	logger  *slog.Logger
+	run       collector.Runner
+	cs        []collector.Collector
+	timeout   time.Duration // upper bound; the scraper's own timeout can lower it
+	base      prometheus.Gatherer
+	sem       chan struct{}
+	responses chan struct{} // retained snapshots and active response writers
+	logger    *slog.Logger
 }
 
 func (e *exporter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	select {
+	case e.responses <- struct{}{}:
+		defer func() { <-e.responses }()
+	default:
+		http.Error(w, "too many concurrent responses", http.StatusServiceUnavailable)
+		return
+	}
 	ms, ok := e.scrape(r)
 	if !ok {
 		http.Error(w, "too many concurrent scrapes", http.StatusServiceUnavailable)
@@ -59,8 +67,10 @@ func (e *exporter) scrape(r *http.Request) ([]prometheus.Metric, bool) {
 // it announces one, so the answer arrives before the scraper gives up.
 func (e *exporter) deadline(r *http.Request) time.Duration {
 	d := e.timeout
-	if s, err := strconv.ParseFloat(r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"), 64); err == nil && s > 0 {
-		d = min(d, time.Duration(0.9*s*float64(time.Second)))
+	if s, err := strconv.ParseFloat(r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"), 64); err == nil && s > 0 && 0.9*s < d.Seconds() {
+		// Compare before converting: an infinite or oversized header must not
+		// overflow time.Duration and turn the budget into an expired deadline.
+		d = time.Duration(0.9 * s * float64(time.Second))
 	}
 	return d
 }

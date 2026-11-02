@@ -30,6 +30,10 @@ import (
 // more get 503 instead of piling vtysh processes onto FRR.
 const maxScrapes = 4
 
+// maxResponses bounds snapshots held by clients that read slowly, while
+// leaving room for new reads when the first four scrapes are writing.
+const maxResponses = 2 * maxScrapes
+
 type config struct {
 	listen, certFile, keyFile, clientCAFile string
 	collectors, vtysh                       string
@@ -79,35 +83,45 @@ func main() {
 	src := &tlsSource{cfg: c, logger: logger}
 	base := prometheus.NewRegistry()
 	base.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}), src)
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", &exporter{run: collector.Vtysh{Path: c.vtysh}.Run, cs: cs, timeout: c.timeout, base: base, sem: make(chan struct{}, maxScrapes), logger: logger})
+	e := &exporter{run: collector.Vtysh{Path: c.vtysh}.Run, cs: cs, timeout: c.timeout, base: base,
+		sem: make(chan struct{}, maxScrapes), responses: make(chan struct{}, maxResponses), logger: logger}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, src, mux, logger); err != nil {
+	if err := run(ctx, src, e, logger); err != nil {
 		logger.Error("exiting", "error", err)
 		os.Exit(1)
 	}
 	logger.Info("stopped")
 }
 
-// run serves h until ctx is cancelled, then drains in-flight scrapes. Scrapes
+// run serves /metrics until ctx is cancelled, then drains in-flight scrapes. Scrapes
 // still running after the grace period are cancelled, and run waits for their
 // vtysh processes to be killed before it returns, so none outlives the exporter.
-func run(ctx context.Context, src *tlsSource, h http.Handler, logger *slog.Logger) error {
+func run(ctx context.Context, src *tlsSource, e *exporter, logger *slog.Logger) error {
 	if _, err := src.get(nil); err != nil {
 		return err
 	}
 	c := src.cfg
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", e)
 	srv := &http.Server{
-		Addr:              c.listen,
-		Handler:           h,
-		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS13, GetConfigForClient: src.get},
-		ReadHeaderTimeout: 3 * time.Second,
-		WriteTimeout:      c.timeout + 5*time.Second, // covers the scrape and the response
-		IdleTimeout:       2 * time.Minute,
-		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+		Addr:         c.listen,
+		Handler:      mux,
+		BaseContext:  func(net.Listener) context.Context { return requestCtx },
+		TLSConfig:    &tls.Config{MinVersion: tls.VersionTLS13, GetConfigForClient: src.get},
+		ReadTimeout:  3 * time.Second,           // includes request bodies; write deadlines cannot bound body draining
+		WriteTimeout: c.timeout + 5*time.Second, // covers the scrape and the response
+		IdleTimeout:  2 * time.Minute,
+		ErrorLog:     slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
+	defer func() {
+		// Connection closure does not always cancel a handler with an unread body.
+		cancelRequests()
+		srv.Close()
+		e.Wait()
+	}()
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServeTLS("", "") }()
 	select {
@@ -117,14 +131,7 @@ func run(ctx context.Context, src *tlsSource, h http.Handler, logger *slog.Logge
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), c.grace)
 	defer cancel()
-	err := srv.Shutdown(shutdownCtx)
-	if err != nil {
-		srv.Close()
-		if w, ok := h.(interface{ Wait() }); ok {
-			w.Wait()
-		}
-	}
-	return err
+	return srv.Shutdown(shutdownCtx)
 }
 
 // checkListen refuses to serve beyond loopback without client certificates.

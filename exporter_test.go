@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ var cs = func() []collector.Collector {
 
 func newExporter(run collector.Runner, timeout time.Duration) *exporter {
 	return &exporter{run: run, cs: cs, timeout: timeout, base: prometheus.NewRegistry(),
-		sem: make(chan struct{}, maxScrapes), logger: discard}
+		sem: make(chan struct{}, maxScrapes), responses: make(chan struct{}, maxResponses), logger: discard}
 }
 
 func TestScrapeDeadline(t *testing.T) {
@@ -145,6 +146,45 @@ func TestScrapeSlotIsFreeWhileTheResponseIsWritten(t *testing.T) {
 	close(release)
 }
 
+func TestSlowResponsesHaveASharedLimitAndRecover(t *testing.T) {
+	var reads atomic.Int32
+	e := newExporter(func(ctx context.Context, command string) ([]byte, error) {
+		reads.Add(1)
+		return quiet(ctx, command)
+	}, time.Second)
+	e.cs = e.cs[:1] // one FRR read for each admitted response
+	release := make(chan struct{})
+	var once sync.Once
+	var done sync.WaitGroup
+	releaseAll := func() { once.Do(func() { close(release) }); done.Wait() }
+	defer releaseAll()
+	for range maxResponses {
+		entered := make(chan struct{})
+		w := &stuckWriter{entered: func() { close(entered) }, release: release}
+		done.Add(1)
+		go func() { defer done.Done(); e.ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil)) }()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("response never reached writer")
+		}
+	}
+	if reads.Load() != int32(maxResponses) {
+		t.Fatalf("got %d admitted reads, want %d", reads.Load(), maxResponses)
+	}
+	before := reads.Load()
+	if code, _ := scrapeBody(t, e); code != http.StatusServiceUnavailable {
+		t.Errorf("response beyond limit: status %d, want 503", code)
+	}
+	if reads.Load() != before {
+		t.Error("rejected response invoked FRR")
+	}
+	releaseAll()
+	if code, _ := scrapeBody(t, e); code != http.StatusOK {
+		t.Errorf("after responses drain: status %d, want 200", code)
+	}
+}
+
 type stuckWriter struct {
 	entered func()
 	release chan struct{}
@@ -184,6 +224,17 @@ func TestScraperTimeoutLowersTheDeadline(t *testing.T) {
 		t.Errorf("an unparseable header changed the deadline to %v", remaining)
 	}
 	mu.Unlock()
+}
+
+func TestInvalidOrLargeScraperTimeoutKeepsTheBudget(t *testing.T) {
+	e := newExporter(quiet, time.Minute)
+	for _, header := range []string{"", "junk", "0", "-1", "NaN", "+Inf", "1e30", "120"} {
+		r := httptest.NewRequest("GET", "/metrics", nil)
+		r.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", header)
+		if got := e.deadline(r); got != e.timeout {
+			t.Errorf("header %q: deadline = %v, want %v", header, got, e.timeout)
+		}
+	}
 }
 
 func TestInconsistentOutputFailsTheScrape(t *testing.T) {
