@@ -94,7 +94,7 @@ func quiet(ctx context.Context, command string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if strings.Contains(command, "bfd") {
+	if strings.Contains(command, "bfd") || command == "show evpn es detail json" {
 		return []byte("[]"), nil
 	}
 	return []byte("{}"), nil

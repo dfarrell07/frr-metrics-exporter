@@ -1,0 +1,27 @@
+[
+  {
+    "esi":"03:44:38:39:ff:ff:01:00:00:01",
+    "accessPort":"bond0",
+    "flags":[
+      "local",
+      "remote",
+      "df",
+      "readyForBgp",
+      "bridgePort",
+      "operUp",
+      "nexthopGroupActive"
+    ],
+    "vniCount":1,
+    "macCount":2,
+    "dfPreference":50000,
+    "nexthopGroup":536870913,
+    "vteps":[
+      {
+        "vtep":"10.77.0.3",
+        "dfAlgorithm":"preference",
+        "dfPreference":40000,
+        "nexthopId":268435458
+      }
+    ]
+  }
+]

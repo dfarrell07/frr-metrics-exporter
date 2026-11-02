@@ -22,15 +22,15 @@ var (
 	bfdSessionUp = desc("bfd_session_up", "BFD session state (1 is up, 0 is down)", bfdLabels...)
 	bfdCounters  = []struct {
 		desc *prometheus.Desc
-		get  func(*bfdCounterRow) *int64
+		get  func(*bfdCounterRow) *uint64
 	}{
-		{desc("bfd_control_packet_input", "Number of received BFD control packets", bfdLabels...), func(r *bfdCounterRow) *int64 { return r.ControlIn }},
-		{desc("bfd_control_packet_output", "Number of sent BFD control packets", bfdLabels...), func(r *bfdCounterRow) *int64 { return r.ControlOut }},
-		{desc("bfd_echo_packet_input", "Number of received BFD echo packets", bfdLabels...), func(r *bfdCounterRow) *int64 { return r.EchoIn }},
-		{desc("bfd_echo_packet_output", "Number of sent BFD echo packets", bfdLabels...), func(r *bfdCounterRow) *int64 { return r.EchoOut }},
-		{desc("bfd_session_up_events", "Number of BFD session up events", bfdLabels...), func(r *bfdCounterRow) *int64 { return r.UpEvents }},
-		{desc("bfd_session_down_events", "Number of BFD session down events", bfdLabels...), func(r *bfdCounterRow) *int64 { return r.DownEvents }},
-		{desc("bfd_zebra_notifications", "Number of BFD zebra notifications", bfdLabels...), func(r *bfdCounterRow) *int64 { return r.ZebraNotifications }},
+		{desc("bfd_control_packet_input", "Number of received BFD control packets", bfdLabels...), func(r *bfdCounterRow) *uint64 { return r.ControlIn }},
+		{desc("bfd_control_packet_output", "Number of sent BFD control packets", bfdLabels...), func(r *bfdCounterRow) *uint64 { return r.ControlOut }},
+		{desc("bfd_echo_packet_input", "Number of received BFD echo packets", bfdLabels...), func(r *bfdCounterRow) *uint64 { return r.EchoIn }},
+		{desc("bfd_echo_packet_output", "Number of sent BFD echo packets", bfdLabels...), func(r *bfdCounterRow) *uint64 { return r.EchoOut }},
+		{desc("bfd_session_up_events", "Number of BFD session up events", bfdLabels...), func(r *bfdCounterRow) *uint64 { return r.UpEvents }},
+		{desc("bfd_session_down_events", "Number of BFD session down events", bfdLabels...), func(r *bfdCounterRow) *uint64 { return r.DownEvents }},
+		{desc("bfd_zebra_notifications", "Number of BFD zebra notifications", bfdLabels...), func(r *bfdCounterRow) *uint64 { return r.ZebraNotifications }},
 	}
 )
 
@@ -41,35 +41,42 @@ type bfdKey struct {
 	VRF       string `json:"vrf"`
 	Local     string `json:"local"`
 	Interface string `json:"interface"`
-	Multihop  bool   `json:"multihop"`
+	Multihop  *bool  `json:"multihop"`
+	ID        uint32 `json:"id"` // correlation only, never a time-series label
 }
 
-func (k bfdKey) labels() []string {
-	return []string{k.Peer, k.VRF, k.Local, k.Interface, strconv.FormatBool(k.Multihop)}
+func (k bfdKey) valid() bool {
+	// FRR may omit local, interface and VRF; never invent those values.
+	return k.ID != 0 && k.Peer != "" && k.Multihop != nil
+}
+
+func (k bfdKey) labels() [5]string {
+	return [5]string{k.Peer, k.VRF, k.Local, k.Interface, strconv.FormatBool(*k.Multihop)}
 }
 
 type bfdSessionRow struct {
 	bfdKey
-	Status string `json:"status"`
+	Status string          `json:"status"`
+	Name   json.RawMessage `json:"bfd-name"` // present for nonordinary modes; never merge their identities
 }
 
 // The counters are pointers: a field FRR does not report is omitted, not 0.
 type bfdCounterRow struct {
 	bfdKey
-	ControlIn          *int64 `json:"control-packet-input"`
-	ControlOut         *int64 `json:"control-packet-output"`
-	EchoIn             *int64 `json:"echo-packet-input"`
-	EchoOut            *int64 `json:"echo-packet-output"`
-	UpEvents           *int64 `json:"session-up"`
-	DownEvents         *int64 `json:"session-down"`
-	ZebraNotifications *int64 `json:"zebra-notifications"`
+	ControlIn          *uint64 `json:"control-packet-input"`
+	ControlOut         *uint64 `json:"control-packet-output"`
+	EchoIn             *uint64 `json:"echo-packet-input"`
+	EchoOut            *uint64 `json:"echo-packet-output"`
+	UpEvents           *uint64 `json:"session-up"`
+	DownEvents         *uint64 `json:"session-down"`
+	ZebraNotifications *uint64 `json:"zebra-notifications"`
 }
 
 // collectBFD reads every session in every VRF with two commands and joins them
-// on the session identity. Both replies come from one FRR function, so the
-// identities agree. A session in only one reply changed between the reads; its
-// counters (or it) are left out until the next scrape. Two sessions with one
-// identity make the data unrepresentable, so the collector fails.
+// on session ID, cross-checking the full label identity. A session present in
+// only one reply changed between reads; discard the whole result so success
+// never describes an incomplete snapshot. Duplicate IDs or label identities
+// also fail rather than silently mixing sessions.
 func collectBFD(ctx context.Context, run Runner) ([]prometheus.Metric, error) {
 	var sessions []bfdSessionRow
 	var counters []bfdCounterRow
@@ -85,38 +92,48 @@ func collectBFD(ctx context.Context, run Runner) ([]prometheus.Metric, error) {
 			return nil, fmt.Errorf("parsing %q: %w", read.command, err)
 		}
 	}
-	byKey := make(map[bfdKey]*bfdCounterRow, len(counters))
-	for i := range counters {
-		if _, dup := byKey[counters[i].bfdKey]; dup {
-			return nil, fmt.Errorf("two BFD counter rows share the identity %+v", counters[i].bfdKey)
-		}
-		byKey[counters[i].bfdKey] = &counters[i]
+	if sessions == nil || counters == nil {
+		return nil, fmt.Errorf("BFD peers and counters must be arrays, not null")
 	}
-	seen := make(map[bfdKey]bool, len(sessions))
+	byID := make(map[uint32]*bfdCounterRow, len(counters))
+	keys := make(map[[5]string]bool, len(counters))
+	for i := range counters {
+		c := &counters[i]
+		if !c.valid() {
+			return nil, fmt.Errorf("BFD counter row has no ID, peer or multihop flag: %+v", c.bfdKey)
+		}
+		if byID[c.ID] != nil || keys[c.labels()] {
+			return nil, fmt.Errorf("duplicate BFD counter ID or identity: %+v", c.bfdKey)
+		}
+		byID[c.ID], keys[c.labels()] = c, true
+	}
 	var ms []prometheus.Metric
 	for _, s := range sessions {
-		if seen[s.bfdKey] {
-			return nil, fmt.Errorf("two BFD sessions share the identity %+v", s.bfdKey)
+		if len(s.Name) != 0 {
+			return nil, fmt.Errorf("BFD session %d uses unsupported named/SBFD mode", s.ID)
 		}
-		seen[s.bfdKey] = true
-		if s.Status == "" {
-			return nil, fmt.Errorf("BFD session %+v has no status", s.bfdKey)
+		if !s.valid() || s.Status == "" {
+			return nil, fmt.Errorf("BFD session has no ID, peer, multihop flag or status: %+v", s.bfdKey)
 		}
+		l := s.labels()
+		c := byID[s.ID]
+		if c == nil || c.labels() != l {
+			return nil, fmt.Errorf("BFD session %d has no matching counters and identity", s.ID)
+		}
+		delete(byID, s.ID)
 		up := 0.0
 		if s.Status == "up" {
 			up = 1
 		}
-		l := s.labels()
-		ms = append(ms, prometheus.MustNewConstMetric(bfdSessionUp, prometheus.GaugeValue, up, l...))
-		c, ok := byKey[s.bfdKey]
-		if !ok {
-			continue
-		}
+		ms = append(ms, prometheus.MustNewConstMetric(bfdSessionUp, prometheus.GaugeValue, up, l[:]...))
 		for _, m := range bfdCounters {
 			if v := m.get(c); v != nil {
-				ms = append(ms, prometheus.MustNewConstMetric(m.desc, prometheus.CounterValue, float64(*v), l...))
+				ms = append(ms, prometheus.MustNewConstMetric(m.desc, prometheus.CounterValue, float64(*v), l[:]...))
 			}
 		}
+	}
+	if len(byID) != 0 {
+		return nil, fmt.Errorf("BFD counters contain %d sessions absent from the peers read", len(byID))
 	}
 	return ms, nil
 }

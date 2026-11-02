@@ -84,6 +84,9 @@ func Gather(ctx context.Context, run Runner, cs []Collector, logger *slog.Logger
 func collectOne(ctx context.Context, run Runner, c Collector, logger *slog.Logger) []prometheus.Metric {
 	start := time.Now()
 	ms, err := c.Collect(ctx, run)
+	if err == nil {
+		err = ctx.Err() // Parsing can finish after the read's context was cancelled.
+	}
 	success := 1.0
 	if err != nil {
 		success, ms = 0, nil

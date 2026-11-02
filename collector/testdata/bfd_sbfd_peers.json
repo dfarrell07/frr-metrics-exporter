@@ -1,0 +1,32 @@
+[
+  {
+    "multihop":false,
+    "peer":"2001:db8::2",
+    "local":"2001:db8::1",
+    "vrf":"default",
+    "id":3550966516,
+    "remote-id":4242,
+    "passive-mode":false,
+    "log-session-changes":false,
+    "bfd-name":"qualified-first",
+    "status":"up",
+    "uptime":3,
+    "diagnostic":"ok",
+    "remote-diagnostic":"ok",
+    "type":"configured",
+    "receive-interval":300,
+    "transmit-interval":300,
+    "echo-receive-interval":50,
+    "configured-echo-transmit-interval":50,
+    "current-echo-transmit-interval":0,
+    "current-detect-echo-receive-interval":0,
+    "detect-multiplier":3,
+    "remote-receive-interval":0,
+    "remote-transmit-interval":1000,
+    "remote-echo-receive-interval":0,
+    "remote-detect-multiplier":3,
+    "rtt-min":0,
+    "rtt-avg":0,
+    "rtt-max":0
+  }
+]

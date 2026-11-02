@@ -1,0 +1,17 @@
+[
+  {
+    "multihop":false,
+    "peer":"2001:db8::2",
+    "local":"2001:db8::1",
+    "vrf":"default",
+    "id":3550966516,
+    "control-packet-input":14,
+    "control-packet-output":28,
+    "echo-packet-input":0,
+    "echo-packet-output":0,
+    "session-up":1,
+    "session-down":0,
+    "zebra-notifications":1,
+    "tx-fail-packet":0
+  }
+]

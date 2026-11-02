@@ -54,12 +54,12 @@ var bgpFamilies = map[string][2]string{
 
 type bgpNeighbor struct {
 	State    string             `json:"bgpState"`
-	Stats    map[string]float64 `json:"messageStats"`
+	Stats    map[string]*uint64 `json:"messageStats"`
 	Families map[string]struct {
 		// Pointers: FRR omits sentPrefixCounter for a family with no update
 		// subgroup, and a missing count must not read as zero.
-		Sent     *float64 `json:"sentPrefixCounter"`
-		Accepted *float64 `json:"acceptedPrefixCounter"`
+		Sent     *uint64 `json:"sentPrefixCounter"`
+		Accepted *uint64 `json:"acceptedPrefixCounter"`
 	} `json:"addressFamilyInfo"`
 }
 
@@ -74,15 +74,35 @@ func collectBGP(ctx context.Context, run Runner) ([]prometheus.Metric, error) {
 	if err := json.Unmarshal(out, &vrfs); err != nil {
 		return nil, fmt.Errorf("parsing BGP neighbors: %w", err)
 	}
+	if vrfs == nil {
+		return nil, fmt.Errorf("BGP neighbors must be an object, not null")
+	}
 	var ms []prometheus.Metric
 	for vrf, entries := range vrfs {
+		if vrf == "" || entries == nil {
+			return nil, fmt.Errorf("invalid BGP VRF %q", vrf)
+		}
 		for peer, raw := range entries {
-			if peer == "vrfId" || peer == "vrfName" {
-				continue
+			// These bookkeeping names can also be unnumbered peer interfaces.
+			// FRR uses scalar metadata and object-valued neighbors in one map.
+			if peer == "vrfId" {
+				var id *int64 // FRR uses -1 for a configured VRF missing from the kernel.
+				if json.Unmarshal(raw, &id) == nil && id != nil {
+					continue
+				}
+			}
+			if peer == "vrfName" {
+				var name *string
+				if json.Unmarshal(raw, &name) == nil && name != nil {
+					continue
+				}
 			}
 			var n bgpNeighbor
 			if err := json.Unmarshal(raw, &n); err != nil {
 				return nil, fmt.Errorf("parsing BGP neighbor %s in VRF %s: %w", peer, vrf, err)
+			}
+			if peer == "" || n.State == "" {
+				return nil, fmt.Errorf("BGP neighbor %q in VRF %s has no identity or state", peer, vrf)
 			}
 			ms = append(ms, n.metrics(peer, vrf)...)
 		}
@@ -99,17 +119,17 @@ func (n bgpNeighbor) metrics(peer, vrf string) []prometheus.Metric {
 	ms := []prometheus.Metric{prometheus.MustNewConstMetric(bgpSessionUp, prometheus.GaugeValue, up, peer, vrf)}
 	for key, f := range n.Families {
 		if f.Sent != nil {
-			announced += *f.Sent
+			announced += float64(*f.Sent)
 		}
 		if f.Accepted != nil {
-			received += *f.Accepted
+			received += float64(*f.Accepted)
 		}
 		if fam, known := bgpFamilies[key]; known {
 			if f.Sent != nil {
-				ms = append(ms, prometheus.MustNewConstMetric(bgpFamilyAnnounced, prometheus.GaugeValue, *f.Sent, peer, vrf, fam[0], fam[1]))
+				ms = append(ms, prometheus.MustNewConstMetric(bgpFamilyAnnounced, prometheus.GaugeValue, float64(*f.Sent), peer, vrf, fam[0], fam[1]))
 			}
 			if f.Accepted != nil {
-				ms = append(ms, prometheus.MustNewConstMetric(bgpFamilyReceived, prometheus.GaugeValue, *f.Accepted, peer, vrf, fam[0], fam[1]))
+				ms = append(ms, prometheus.MustNewConstMetric(bgpFamilyReceived, prometheus.GaugeValue, float64(*f.Accepted), peer, vrf, fam[0], fam[1]))
 			}
 		}
 	}
@@ -117,8 +137,8 @@ func (n bgpNeighbor) metrics(peer, vrf string) []prometheus.Metric {
 		prometheus.MustNewConstMetric(bgpAnnounced, prometheus.GaugeValue, announced, peer, vrf),
 		prometheus.MustNewConstMetric(bgpReceived, prometheus.GaugeValue, received, peer, vrf))
 	for _, m := range bgpMessages {
-		if v, ok := n.Stats[m.key]; ok {
-			ms = append(ms, prometheus.MustNewConstMetric(m.desc, prometheus.CounterValue, v, peer, vrf))
+		if v := n.Stats[m.key]; v != nil {
+			ms = append(ms, prometheus.MustNewConstMetric(m.desc, prometheus.CounterValue, float64(*v), peer, vrf))
 		}
 	}
 	return ms

@@ -1,0 +1,21 @@
+[
+  {
+    "esi":"03:44:38:39:ff:ff:01:00:00:01",
+    "flags":[
+      "remote",
+      "nexthopGroupActive"
+    ],
+    "vniCount":0,
+    "macCount":1,
+    "dfPreference":50000,
+    "nexthopGroup":536870913,
+    "vteps":[
+      {
+        "vtep":"10.77.0.3",
+        "dfAlgorithm":"preference",
+        "dfPreference":40000,
+        "nexthopId":268435458
+      }
+    ]
+  }
+]

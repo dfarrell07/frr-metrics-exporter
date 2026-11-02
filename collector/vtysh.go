@@ -27,7 +27,20 @@ type Vtysh struct {
 
 // Run implements Runner.
 func (v Vtysh) Run(ctx context.Context, command string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, v.Path, "-c", command) // #nosec G204 -- fixed commands from this package
+	// Connecting to every daemon lets one unresponsive daemon stall unrelated
+	// collectors during vtysh initialization. These commands each have one owner.
+	var daemon string
+	switch {
+	case strings.HasPrefix(command, "show bgp "):
+		daemon = "bgpd"
+	case strings.HasPrefix(command, "show bfd "):
+		daemon = "bfdd"
+	case strings.HasPrefix(command, "show evpn "):
+		daemon = "zebra"
+	default:
+		return nil, fmt.Errorf("unsupported vtysh command %q", command)
+	}
+	cmd := exec.CommandContext(ctx, v.Path, "-d", daemon, "-c", command) // #nosec G204 -- fixed commands from this package
 	cmd.WaitDelay = killWaitTime
 	limit := v.MaxOutput
 	if limit == 0 {
