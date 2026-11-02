@@ -12,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
@@ -177,12 +178,12 @@ func get(addr string, tc *tls.Config) (*x509.Certificate, error) {
 }
 
 func TestMutualTLSAndRotation(t *testing.T) {
-	p, dir := newPKI(t), t.TempDir()
+	p, extra, dir := newPKI(t), newPKI(t), t.TempDir()
 	cfg := config{certFile: filepath.Join(dir, "tls.crt"), keyFile: filepath.Join(dir, "tls.key"), clientCAFile: filepath.Join(dir, "ca.crt")}
 	crt, key := p.issue(t, "server-1", 2)
-	write(t, cfg.certFile, crt)
+	write(t, cfg.certFile, []byte(strings.ReplaceAll(string(crt)+string(p.pem), "\n", "\r\n")))
 	write(t, cfg.keyFile, key)
-	write(t, cfg.clientCAFile, p.pem)
+	write(t, cfg.clientCAFile, []byte(strings.ReplaceAll(string(p.pem)+string(extra.pem), "\n", "\r\n")))
 
 	addr, stop := start(t, cfg)
 	defer stop()
@@ -232,9 +233,9 @@ func TestMutualTLSAndRotation(t *testing.T) {
 	// Recover from the corrupt file, then rotate the client CA: the old scraper is refused, one from the new CA is served.
 	np := newPKI(t)
 	crt, key = p.issue(t, "server-3", 7)
-	write(t, cfg.certFile, crt)
+	write(t, cfg.certFile, []byte(strings.ReplaceAll(string(crt)+string(p.pem), "\n", "\r\n")))
 	write(t, cfg.keyFile, key)
-	write(t, cfg.clientCAFile, np.pem)
+	write(t, cfg.clientCAFile, []byte(strings.ReplaceAll(string(np.pem)+string(extra.pem), "\n", "\r\n")))
 	if _, err := get(addr, good); err == nil {
 		t.Error("a client from the replaced CA was still served")
 	}
@@ -623,47 +624,72 @@ func TestTLSCertificateFilesRejectEveryDamagedBlock(t *testing.T) {
 			"empty":               "",
 			"comments only":       "# not a certificate\n",
 		}
-		for name, bundle := range cases {
-			t.Run(file+"/"+name, func(t *testing.T) {
-				dir := t.TempDir()
-				c := config{certFile: filepath.Join(dir, "cert"), keyFile: filepath.Join(dir, "key"), clientCAFile: filepath.Join(dir, "ca")}
-				write(t, c.certFile, crt)
-				if file == "server" {
-					write(t, c.certFile, []byte(first+second))
-				}
-				write(t, c.keyFile, key)
-				write(t, c.clientCAFile, append(append([]byte{}, p.pem...), q.pem...))
-				src := &tlsSource{cfg: c, logger: discard}
-				good, err := src.get(nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				path := c.clientCAFile
-				if file == "server" {
-					path = c.certFile
-				}
-				write(t, path, []byte(bundle))
-				got, err := src.get(nil)
-				if err != nil || got != good {
-					t.Fatalf("damaged bundle replaced last-good config: err=%v", err)
-				}
-				if v := gauge(t, src, "frrk8s_exporter_tls_config_current"); v != 0 {
-					t.Fatalf("reload health=%v, want 0", v)
-				}
-			})
+		for _, eol := range []string{"\n", "\r\n"} {
+			for name, bundle := range cases {
+				t.Run(fmt.Sprintf("%s/%q/%s", file, eol, name), func(t *testing.T) {
+					dir := t.TempDir()
+					c := config{certFile: filepath.Join(dir, "cert"), keyFile: filepath.Join(dir, "key"), clientCAFile: filepath.Join(dir, "ca")}
+					write(t, c.certFile, crt)
+					if file == "server" {
+						write(t, c.certFile, []byte(first+second))
+					}
+					write(t, c.keyFile, key)
+					write(t, c.clientCAFile, append(append([]byte{}, p.pem...), q.pem...))
+					src := &tlsSource{cfg: c, logger: discard}
+					good, err := src.get(nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					path := c.clientCAFile
+					if file == "server" {
+						path = c.certFile
+					}
+					original, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					write(t, path, []byte(strings.ReplaceAll(bundle, "\n", eol)))
+					if _, err := (&tlsSource{cfg: c, logger: discard}).get(nil); err == nil {
+						t.Error("damaged bundle accepted at startup")
+					}
+					got, err := src.get(nil)
+					if err != nil || got != good {
+						t.Fatalf("damaged bundle replaced last-good config: err=%v", err)
+					}
+					if v := gauge(t, src, "frrk8s_exporter_tls_config_current"); v != 0 {
+						t.Fatalf("reload health=%v, want 0", v)
+					}
+					write(t, path, []byte(strings.ReplaceAll(string(original), "\n", eol)))
+					if v := gauge(t, src, "frrk8s_exporter_tls_config_current"); v != 1 {
+						t.Fatalf("valid %q replacement did not restore reload health: %v", eol, v)
+					}
+				})
+			}
 		}
 	}
 }
 
-func TestTLSClientCABundleAllowsComments(t *testing.T) {
+func TestTLSClientCABundles(t *testing.T) {
 	p, q := newPKI(t), newPKI(t)
-	bundle := " \n# first root\n\t" + string(p.pem) + "\n \t# second root, literal -----BEGIN CERTIFICATE-----\n" + string(q.pem) + "\n# end without newline"
-	pool, err := clientCAPool([]byte(bundle))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(pool.Subjects()) != 2 {
-		t.Fatalf("got %d roots, want 2", len(pool.Subjects()))
+	for name, bundle := range map[string]struct {
+		data  string
+		roots int
+	}{
+		"single":   {string(p.pem), 1},
+		"multiple": {string(p.pem) + string(q.pem), 2},
+		"comments": {" \n# first root\n\t" + string(p.pem) + "\n \t# second root, literal -----BEGIN CERTIFICATE-----\n" + string(q.pem) + "\n# end without newline", 2},
+	} {
+		for _, eol := range []string{"\n", "\r\n"} {
+			t.Run(fmt.Sprintf("%s/%q", name, eol), func(t *testing.T) {
+				pool, err := clientCAPool([]byte(strings.ReplaceAll(bundle.data, "\n", eol)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(pool.Subjects()) != bundle.roots {
+					t.Fatalf("got %d roots, want %d", len(pool.Subjects()), bundle.roots)
+				}
+			})
+		}
 	}
 }
 
@@ -747,14 +773,26 @@ func TestTLSDoesNotRequireKeyPairLeafCache(t *testing.T) {
 func TestTLSServesEveryValidatedCertificateBlock(t *testing.T) {
 	p := newPKI(t)
 	cert, key := p.issue(t, "server", 2)
-	for _, gap := range []string{"", "\n\t", "\n# intermediate\n\t"} {
-		cfg, err := build(gap+string(cert)+gap+string(p.pem), string(key), "", false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		chain := cfg.Certificates[0].Certificate
-		if len(chain) != 2 || string(chain[1]) != string(p.ca.Raw) {
-			t.Fatalf("gap %q: served chain does not contain every validated certificate", gap)
+	for _, eol := range []string{"\n", "\r\n"} {
+		for _, withRoot := range []bool{false, true} {
+			for _, gap := range []string{"", "\n\t", "\n# intermediate\n\t"} {
+				t.Run(fmt.Sprintf("%q/root=%v/gap=%q", eol, withRoot, gap), func(t *testing.T) {
+					bundle := gap + string(cert)
+					want := 1
+					if withRoot {
+						bundle += gap + string(p.pem)
+						want++
+					}
+					cfg, err := build(strings.ReplaceAll(bundle, "\n", eol), strings.ReplaceAll(string(key), "\n", eol), "", false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					chain := cfg.Certificates[0].Certificate
+					if len(chain) != want || (withRoot && string(chain[1]) != string(p.ca.Raw)) {
+						t.Fatal("served chain does not contain every validated certificate")
+					}
+				})
+			}
 		}
 	}
 }

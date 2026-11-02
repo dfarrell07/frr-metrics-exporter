@@ -172,7 +172,7 @@ func certificatePEM(data []byte) ([]*x509.Certificate, error) {
 		}
 		chunk := data
 		if next := bytes.Index(data[1:], []byte("\n-----BEGIN ")); next >= 0 {
-			chunk = data[:next+1]
+			chunk = data[:next+2] // Include LF: a CRLF END line must retain both bytes.
 		}
 		block, rest := pem.Decode(chunk)
 		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
