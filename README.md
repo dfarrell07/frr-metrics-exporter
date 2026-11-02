@@ -138,6 +138,8 @@ more seconds. Admission bounds concurrency, not a fixed memory allowance.
 
 ## Verification and qualification
 
+GitHub Actions runs `make check` and `make build`; smoke, load and vulnerability checks remain manual.
+
 | Command | Coverage / prerequisites |
 | --- | --- |
 | `make check` | gofmt, vet and race-enabled parser/server tests, using [real fixtures and provenance](collector/testdata/README.md). |

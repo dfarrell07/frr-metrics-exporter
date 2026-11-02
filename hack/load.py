@@ -87,7 +87,9 @@ with tempfile.TemporaryDirectory(prefix="frr-load-") as directory:
                 wire = response.read()
                 assert response.status == expected, (response.status, wire[:200])
                 if expected == 200:
-                    body = gzip.decompress(wire) if response.getheader("Content-Encoding") == "gzip" else wire
+                    actual_encoding = response.getheader("Content-Encoding", "identity").lower()
+                    assert actual_encoding == encoding, (encoding, actual_encoding)
+                    body = gzip.decompress(wire) if actual_encoding == "gzip" else wire
                     for collector in ("bgp", "bfd", "evpn"):
                         assert f'frrk8s_scrape_collector_success{{collector="{collector}"}} 1\n'.encode() in body
                     samples = [line for line in body.splitlines() if line.startswith(b"frrk8s_")]
