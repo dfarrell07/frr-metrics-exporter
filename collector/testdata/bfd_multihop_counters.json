@@ -1,0 +1,16 @@
+[
+  {
+    "multihop":true,
+    "peer":"10.80.0.3",
+    "local":"10.80.0.2",
+    "vrf":"default",
+    "id":543663694,
+    "control-packet-input":49,
+    "control-packet-output":49,
+    "echo-packet-input":0,
+    "echo-packet-output":0,
+    "session-up":1,
+    "session-down":0,
+    "zebra-notifications":2
+  }
+]

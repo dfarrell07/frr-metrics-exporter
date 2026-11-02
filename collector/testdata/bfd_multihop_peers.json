@@ -1,0 +1,30 @@
+[
+  {
+    "multihop":true,
+    "peer":"10.80.0.3",
+    "local":"10.80.0.2",
+    "vrf":"default",
+    "id":543663694,
+    "remote-id":543663694,
+    "passive-mode":false,
+    "log-session-changes":false,
+    "minimum-ttl":254,
+    "status":"up",
+    "uptime":12,
+    "diagnostic":"ok",
+    "remote-diagnostic":"ok",
+    "type":"dynamic",
+    "receive-interval":300,
+    "transmit-interval":300,
+    "echo-receive-interval":50,
+    "echo-transmit-interval":0,
+    "detect-multiplier":3,
+    "remote-receive-interval":300,
+    "remote-transmit-interval":300,
+    "remote-echo-receive-interval":50,
+    "remote-detect-multiplier":3,
+    "rtt-min":0,
+    "rtt-avg":0,
+    "rtt-max":0
+  }
+]
