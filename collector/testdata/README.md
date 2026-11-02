@@ -17,6 +17,13 @@ All five were down. Invalid-input tests corrupt these and the other real capture
 discriminator 4242. FRR marks nonordinary modes with `bfd-name`; this must fail ordinary
 BFD collection even when no other session collides on the exported labels.
 
+`bgp_families.json` was captured on 2026-11-02 with `show bgp vrf all neighbors json`,
+using the same 10.4.3 image digest above. Two peers (`10.193.0.2/.3`, AS 65001/65002)
+activate IPv6 unicast and IPv4 VPN, with default IPv4 unicast and network import checks
+disabled. Each originates `2001:db8:{1,2}::/64`; VRF `red` (table 193) originates
+`192.0.{1,2}.0/24`, exported with labels 101/102, RDs `6500{1,2}:100` and RT `65000:100`.
+FRR reports one accepted and two sent prefixes per family; tests preserve those counts.
+
 `bgp_reserved_interfaces.json` captures actual unnumbered peers named `vrfId` and `vrfName`:
 FRR places neighbor objects under the same keys it otherwise uses for scalar bookkeeping.
 `bgp_unknown_vrf.json` captures a configured BGP VRF without a kernel VRF, whose bookkeeping

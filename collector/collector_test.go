@@ -174,8 +174,15 @@ func TestBGPFromRealFRR(t *testing.T) {
 		"frrk8s_bgp_announced_prefixes_total" + p: 4, // 1 IPv4 + 3 EVPN
 		"frrk8s_bgp_received_prefixes_total" + p:  2,
 		"frrk8s_bgp_opens_sent" + p:               2,
-		"frrk8s_bgp_total_received" + p:           8,
+		"frrk8s_bgp_opens_received" + p:           1,
+		"frrk8s_bgp_notifications_sent" + p:       0,
 		"frrk8s_bgp_updates_total" + p:            6,
+		"frrk8s_bgp_updates_total_received" + p:   6,
+		"frrk8s_bgp_keepalives_sent" + p:          1,
+		"frrk8s_bgp_keepalives_received" + p:      1,
+		"frrk8s_bgp_route_refresh_sent" + p:       0,
+		"frrk8s_bgp_total_sent" + p:               9,
+		"frrk8s_bgp_total_received" + p:           8,
 		`frrk8s_bgp_family_received_prefixes{afi="ipv4",peer="10.78.0.3",safi="unicast",vrf="default"}`:  1,
 		`frrk8s_bgp_family_received_prefixes{afi="l2vpn",peer="10.78.0.3",safi="evpn",vrf="default"}`:    1,
 		`frrk8s_bgp_family_announced_prefixes{afi="ipv4",peer="10.78.0.3",safi="unicast",vrf="default"}`: 1,
@@ -188,6 +195,23 @@ func TestBGPFromRealFRR(t *testing.T) {
 			t.Errorf("series for a VRF without peers: %s", k)
 		}
 	}
+}
+
+func TestBGPIPv6AndVPNFromRealFRR(t *testing.T) {
+	ms, err := collectBGP(context.Background(), fake(map[string]string{bgpCmd: "@bgp_families.json"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := series(t, ms)
+	expect(t, got, map[string]float64{
+		`frrk8s_bgp_session_up{peer="10.193.0.3",vrf="default"}`:                                          1,
+		`frrk8s_bgp_family_received_prefixes{afi="ipv6",peer="10.193.0.3",safi="unicast",vrf="default"}`:  1,
+		`frrk8s_bgp_family_announced_prefixes{afi="ipv6",peer="10.193.0.3",safi="unicast",vrf="default"}`: 2,
+		`frrk8s_bgp_family_received_prefixes{afi="ipv4",peer="10.193.0.3",safi="vpn",vrf="default"}`:      1,
+		`frrk8s_bgp_family_announced_prefixes{afi="ipv4",peer="10.193.0.3",safi="vpn",vrf="default"}`:     2,
+		`frrk8s_bgp_received_prefixes_total{peer="10.193.0.3",vrf="default"}`:                             2,
+		`frrk8s_bgp_announced_prefixes_total{peer="10.193.0.3",vrf="default"}`:                            4,
+	})
 }
 
 func TestBGPFamilies(t *testing.T) {
