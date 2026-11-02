@@ -1,6 +1,7 @@
 .PHONY: check build smoke vuln
 check:
-	@test -z "$$(gofmt -l .)" || { gofmt -l .; exit 1; }
+	@unformatted=$$(gofmt -l .) || exit $$?; \
+		test -z "$$unformatted" || { printf '%s\n' "$$unformatted"; exit 1; }
 	go vet ./...
 	go test -race ./...
 
