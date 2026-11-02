@@ -47,6 +47,6 @@ Run all three before committing. Sign off commits (`git commit -s`).
 
 ## Open
 
-Publish the repo (not done); EVPN ES/DF, per-VTEP membership and BFD RTT are not implemented (need a
+EVPN ES/DF, per-VTEP membership and BFD RTT are not implemented (need a
 multihoming lab / a latency-source decision); appliance unit and scrape wiring belong in the EGA
 collection and wait on decision 10 and the scrape-path choice.
