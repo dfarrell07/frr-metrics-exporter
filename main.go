@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -63,8 +64,8 @@ func parseFlags() (config, []collector.Collector, error) {
 	case err != nil:
 	case c.certFile == "" || c.keyFile == "" || flag.NArg() > 0:
 		err = errors.New("--tls-cert-file and --tls-key-file are required, and no arguments are accepted")
-	case c.timeout <= 0:
-		err = errors.New("--scrape-timeout must be positive")
+	case c.timeout <= 0 || c.timeout > time.Duration(math.MaxInt64)-5*time.Second:
+		err = errors.New("--scrape-timeout must be positive and leave room for the 5s response budget")
 	default:
 		err = checkListen(c)
 	}

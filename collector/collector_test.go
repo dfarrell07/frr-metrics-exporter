@@ -163,7 +163,28 @@ func TestMetricContractFromRealFRR(t *testing.T) {
 }
 
 func TestBGPFromRealFRR(t *testing.T) {
-	ms, err := collectBGP(context.Background(), fake(map[string]string{bgpCmd: "@bgp_neighbors.json"}))
+	raw, err := os.ReadFile("testdata/bgp_neighbors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vrfs map[string]any
+	if err := json.Unmarshal(raw, &vrfs); err != nil {
+		t.Fatal(err)
+	}
+	// Preserve the captured shape, with distinct counters so source swaps cannot hide.
+	stats := vrfs["default"].(map[string]any)["10.78.0.3"].(map[string]any)["messageStats"].(map[string]any)
+	for key, value := range map[string]int{
+		"opensSent": 11, "opensRecv": 12, "notificationsSent": 13,
+		"updatesSent": 14, "updatesRecv": 15, "keepalivesSent": 16,
+		"keepalivesRecv": 17, "routeRefreshSent": 18, "totalSent": 72, "totalRecv": 44,
+	} {
+		stats[key] = value
+	}
+	raw, err = json.Marshal(vrfs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := collectBGP(context.Background(), fake(map[string]string{bgpCmd: string(raw)}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,9 +194,16 @@ func TestBGPFromRealFRR(t *testing.T) {
 		"frrk8s_bgp_session_up" + p:               1,
 		"frrk8s_bgp_announced_prefixes_total" + p: 4, // 1 IPv4 + 3 EVPN
 		"frrk8s_bgp_received_prefixes_total" + p:  2,
-		"frrk8s_bgp_opens_sent" + p:               2,
-		"frrk8s_bgp_total_received" + p:           8,
-		"frrk8s_bgp_updates_total" + p:            6,
+		"frrk8s_bgp_opens_sent" + p:               11,
+		"frrk8s_bgp_opens_received" + p:           12,
+		"frrk8s_bgp_notifications_sent" + p:       13,
+		"frrk8s_bgp_updates_total" + p:            14,
+		"frrk8s_bgp_updates_total_received" + p:   15,
+		"frrk8s_bgp_keepalives_sent" + p:          16,
+		"frrk8s_bgp_keepalives_received" + p:      17,
+		"frrk8s_bgp_route_refresh_sent" + p:       18,
+		"frrk8s_bgp_total_sent" + p:               72,
+		"frrk8s_bgp_total_received" + p:           44,
 		`frrk8s_bgp_family_received_prefixes{afi="ipv4",peer="10.78.0.3",safi="unicast",vrf="default"}`:  1,
 		`frrk8s_bgp_family_received_prefixes{afi="l2vpn",peer="10.78.0.3",safi="evpn",vrf="default"}`:    1,
 		`frrk8s_bgp_family_announced_prefixes{afi="ipv4",peer="10.78.0.3",safi="unicast",vrf="default"}`: 1,
@@ -188,6 +216,23 @@ func TestBGPFromRealFRR(t *testing.T) {
 			t.Errorf("series for a VRF without peers: %s", k)
 		}
 	}
+}
+
+func TestBGPIPv6AndVPNFromRealFRR(t *testing.T) {
+	ms, err := collectBGP(context.Background(), fake(map[string]string{bgpCmd: "@bgp_families.json"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := series(t, ms)
+	expect(t, got, map[string]float64{
+		`frrk8s_bgp_session_up{peer="10.193.0.3",vrf="default"}`:                                          1,
+		`frrk8s_bgp_family_received_prefixes{afi="ipv6",peer="10.193.0.3",safi="unicast",vrf="default"}`:  1,
+		`frrk8s_bgp_family_announced_prefixes{afi="ipv6",peer="10.193.0.3",safi="unicast",vrf="default"}`: 2,
+		`frrk8s_bgp_family_received_prefixes{afi="ipv4",peer="10.193.0.3",safi="vpn",vrf="default"}`:      1,
+		`frrk8s_bgp_family_announced_prefixes{afi="ipv4",peer="10.193.0.3",safi="vpn",vrf="default"}`:     2,
+		`frrk8s_bgp_received_prefixes_total{peer="10.193.0.3",vrf="default"}`:                             2,
+		`frrk8s_bgp_announced_prefixes_total{peer="10.193.0.3",vrf="default"}`:                            4,
+	})
 }
 
 func TestBGPFamilies(t *testing.T) {
@@ -366,17 +411,40 @@ func TestCorruptFixtureFieldsFailOnlyTheirCollector(t *testing.T) {
 }
 
 func TestBFDFromRealFRR(t *testing.T) {
-	ms, err := collectBFD(context.Background(), fake(map[string]string{
-		"show bfd peers json": "@bfd_peers.json", "show bfd peers counters json": "@bfd_counters.json"}))
+	raw, err := os.ReadFile("testdata/bfd_counters.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	// Keep the real identity and shape, with distinct values for every source.
+	for key, value := range map[string]int{
+		"control-packet-input": 101, "control-packet-output": 102,
+		"echo-packet-input": 103, "echo-packet-output": 104,
+		"session-up": 106, "session-down": 105, "zebra-notifications": 107,
+	} {
+		rows[0][key] = value
+	}
+	raw, err = json.Marshal(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := collectBFD(context.Background(), fake(map[string]string{peersCmd: "@bfd_peers.json", countersCmd: string(raw)}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	const id = `{interface="eth0",local="10.78.0.2",multihop="false",peer="10.78.0.3",vrf="default"}`
 	expect(t, series(t, ms), map[string]float64{
-		"frrk8s_bfd_session_up" + id:           1,
-		"frrk8s_bfd_control_packet_input" + id: 107,
-		"frrk8s_bfd_session_up_events" + id:    1,
-		"frrk8s_bfd_zebra_notifications" + id:  2,
+		"frrk8s_bfd_session_up" + id:            1,
+		"frrk8s_bfd_control_packet_input" + id:  101,
+		"frrk8s_bfd_control_packet_output" + id: 102,
+		"frrk8s_bfd_echo_packet_input" + id:     103,
+		"frrk8s_bfd_echo_packet_output" + id:    104,
+		"frrk8s_bfd_session_up_events" + id:     106,
+		"frrk8s_bfd_session_down_events" + id:   105,
+		"frrk8s_bfd_zebra_notifications" + id:   107,
 	})
 }
 
