@@ -51,6 +51,25 @@ func TestScrapeTimeoutFlagBounds(t *testing.T) {
 	}
 }
 
+func TestListenFlagRequiresClientCA(t *testing.T) {
+	args, flags := os.Args, flag.CommandLine
+	t.Cleanup(func() { os.Args, flag.CommandLine = args, flags })
+	for _, tc := range []struct{ listen, ca string }{
+		{"127.0.0.1:9141", ""}, {"0.0.0.0:9141", ""},
+		{"0.0.0.0:9141", "ca.crt"}, {"[::]:9141", ""}, {"[::]:9141", "ca.crt"},
+	} {
+		t.Run(tc.listen+"/"+tc.ca, func(t *testing.T) {
+			flag.CommandLine = flag.NewFlagSet("exporter", flag.ContinueOnError)
+			os.Args = []string{"exporter", "--tls-cert-file=server.crt", "--tls-key-file=server.key", "--listen=" + tc.listen, "--tls-client-ca-file=" + tc.ca}
+			_, _, err := parseFlags()
+			valid := tc.listen == "127.0.0.1:9141" || tc.ca != ""
+			if (err == nil) != valid {
+				t.Fatalf("listen %q, client CA %q: error=%v, want valid=%v", tc.listen, tc.ca, err, valid)
+			}
+		})
+	}
+}
+
 func TestMainUsesConfiguredScrapeTimeout(t *testing.T) {
 	// Re-enter the real startup path in a child, including flags, runner and TLS.
 	if os.Getenv("FRR_TEST_EXPORTER_MAIN") == "1" {
@@ -129,6 +148,11 @@ func TestMainUsesConfiguredScrapeTimeout(t *testing.T) {
 	if err != nil || resp.StatusCode != http.StatusOK || time.Since(start) > 2*time.Second ||
 		!strings.Contains(string(body), `frrk8s_scrape_collector_success{collector="bgp"} 0`) {
 		t.Fatalf("scrape after %v: status=%d, error=%v, body=%s", time.Since(start), resp.StatusCode, err, body)
+	}
+	for _, disabled := range []string{"bfd", "evpn"} {
+		if strings.Contains(string(body), fmt.Sprintf(`frrk8s_scrape_collector_success{collector=%q}`, disabled)) {
+			t.Errorf("disabled %s collector ran", disabled)
+		}
 	}
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
